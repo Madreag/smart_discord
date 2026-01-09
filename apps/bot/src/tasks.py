@@ -37,6 +37,16 @@ celery_app.conf.update(
 )
 
 
+def get_db_engine():
+    """Get sync database engine."""
+    from sqlalchemy import create_engine
+    from apps.bot.src.config import get_bot_settings
+    
+    settings = get_bot_settings()
+    sync_url = settings.database_url.replace("+asyncpg", "")
+    return create_engine(sync_url, pool_pre_ping=True)
+
+
 @celery_app.task(bind=True, name="index_messages")
 def index_messages(self, payload_dict: dict) -> dict:
     """
@@ -50,18 +60,68 @@ def index_messages(self, payload_dict: dict) -> dict:
     Returns:
         Result dict with indexed message IDs
     """
-    payload = IndexTaskPayload(**payload_dict)
+    from sqlalchemy import text
+    from apps.api.src.core.llm_factory import get_embedding_model
+    from apps.api.src.services.qdrant_service import qdrant_service
+    from apps.api.src.services.enrichment_service import enrich_session
     
-    # TODO: Implement actual indexing logic
-    # 1. Verify messages exist in Postgres
-    # 2. Generate embeddings
-    # 3. Upsert to Qdrant with guild_id in payload
-    # 4. Update qdrant_point_id in Postgres
+    payload = IndexTaskPayload(**payload_dict)
+    engine = get_db_engine()
+    
+    # 1. Fetch messages from Postgres
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT m.id, m.content, m.message_timestamp, u.username, u.global_name
+            FROM messages m
+            JOIN users u ON m.author_id = u.id
+            WHERE m.id = ANY(:message_ids)
+              AND m.guild_id = :guild_id
+              AND m.is_deleted = FALSE
+            ORDER BY m.message_timestamp ASC
+        """), {"message_ids": payload.message_ids, "guild_id": payload.guild_id})
+        
+        rows = result.fetchall()
+    
+    if not rows:
+        return {"status": "skipped", "reason": "no_messages_found"}
+    
+    # 2. Enrich messages with metadata
+    messages = [
+        {
+            "content": row.content,
+            "author_name": row.global_name or row.username,
+            "timestamp": row.message_timestamp,
+        }
+        for row in rows
+    ]
+    
+    enriched_text = enrich_session(messages, channel_name=payload.channel_name)
+    
+    # 3. Generate embedding
+    embedding_model = get_embedding_model()
+    embedding = embedding_model.embed_query(enriched_text)
+    
+    # 4. Upsert to Qdrant
+    session_id = str(uuid4())
+    success = qdrant_service.upsert_session(
+        session_id=session_id,
+        guild_id=payload.guild_id,
+        channel_id=payload.channel_id,
+        embedding=embedding,
+        message_ids=payload.message_ids,
+        content_preview=enriched_text[:500],
+        start_time=payload.start_time or datetime.utcnow().isoformat(),
+        end_time=payload.end_time or datetime.utcnow().isoformat(),
+    )
+    
+    if not success:
+        raise Exception("Qdrant upsert failed")
     
     return {
         "status": "success",
         "guild_id": payload.guild_id,
         "channel_id": payload.channel_id,
+        "session_id": session_id,
         "indexed_count": len(payload.message_ids),
     }
 
@@ -80,18 +140,25 @@ def delete_message_vector(self, payload_dict: dict) -> dict:
     Returns:
         Result dict with deletion status
     """
+    from apps.api.src.services.qdrant_service import qdrant_service
+    
     payload = DeleteTaskPayload(**payload_dict)
     
-    # TODO: Implement actual deletion logic
-    # 1. Verify message is soft-deleted in Postgres
-    # 2. Delete vector from Qdrant by point_id
-    # 3. Clear qdrant_point_id in Postgres
+    # Delete vector from Qdrant by point_id if provided
+    if payload.qdrant_point_id:
+        success = qdrant_service.delete_by_session_id(payload.qdrant_point_id)
+        return {
+            "status": "success" if success else "not_found",
+            "guild_id": payload.guild_id,
+            "message_id": payload.message_id,
+            "deleted_point_id": payload.qdrant_point_id,
+        }
     
     return {
-        "status": "success",
+        "status": "skipped",
         "guild_id": payload.guild_id,
         "message_id": payload.message_id,
-        "deleted_point_id": payload.qdrant_point_id,
+        "reason": "no_qdrant_point_id",
     }
 
 
@@ -100,21 +167,18 @@ def process_session(
     self,
     guild_id: int,
     channel_id: int,
+    channel_name: str,
     message_ids: list[int],
     start_time: str,
     end_time: str,
 ) -> dict:
     """
-    Process a message session using the Sliding Window Sessionizer.
-    
-    Groups messages by:
-    - Same channel_id
-    - Time difference < 15 minutes
-    - No topic shifts or reply chain breaks
+    Process a message session - fetch, embed, and store in Qdrant.
     
     Args:
         guild_id: Guild ID
         channel_id: Channel ID
+        channel_name: Channel name for context
         message_ids: List of message IDs in session
         start_time: Session start timestamp (ISO format)
         end_time: Session end timestamp (ISO format)
@@ -122,15 +186,64 @@ def process_session(
     Returns:
         Result dict with session info
     """
-    session_id = str(uuid4())
+    from sqlalchemy import text
+    from apps.api.src.core.llm_factory import get_embedding_model
+    from apps.api.src.services.qdrant_service import qdrant_service
+    from apps.api.src.services.enrichment_service import enrich_session
     
-    # TODO: Implement actual session processing
-    # 1. Fetch message content from Postgres
-    # 2. Concatenate into session text
+    session_id = str(uuid4())
+    engine = get_db_engine()
+    
+    # 1. Fetch messages from Postgres
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT m.id, m.content, m.message_timestamp, m.author_id,
+                   u.username, u.global_name
+            FROM messages m
+            JOIN users u ON m.author_id = u.id
+            WHERE m.id = ANY(:message_ids)
+              AND m.guild_id = :guild_id
+              AND m.is_deleted = FALSE
+            ORDER BY m.message_timestamp ASC
+        """), {"message_ids": message_ids, "guild_id": guild_id})
+        
+        rows = result.fetchall()
+    
+    if not rows:
+        return {"status": "skipped", "reason": "no_messages_found"}
+    
+    # 2. Enrich messages with metadata
+    messages = [
+        {
+            "content": row.content,
+            "author_name": row.global_name or row.username,
+            "timestamp": row.message_timestamp,
+        }
+        for row in rows
+    ]
+    author_ids = list(set(row.author_id for row in rows))
+    
+    enriched_text = enrich_session(messages, channel_name=channel_name)
+    
     # 3. Generate embedding
-    # 4. Create summary using LLM
-    # 5. Insert session record in Postgres
-    # 6. Upsert session vector to Qdrant
+    embedding_model = get_embedding_model()
+    embedding = embedding_model.embed_query(enriched_text)
+    
+    # 4. Upsert to Qdrant
+    success = qdrant_service.upsert_session(
+        session_id=session_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        embedding=embedding,
+        message_ids=message_ids,
+        content_preview=enriched_text[:500],
+        start_time=start_time,
+        end_time=end_time,
+        author_ids=author_ids,
+    )
+    
+    if not success:
+        raise Exception("Qdrant upsert failed")
     
     return {
         "status": "success",

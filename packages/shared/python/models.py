@@ -107,6 +107,8 @@ class AskQuery(BaseModel):
     guild_id: int
     query: str
     channel_ids: Optional[list[int]] = None
+    channel_id: Optional[int] = None  # Current channel for conversation memory
+    author_name: Optional[str] = None  # For conversation context
 
 
 class MessageSource(BaseModel):

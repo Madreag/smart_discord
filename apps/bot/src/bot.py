@@ -172,17 +172,18 @@ async def on_message_handler(message: discord.Message) -> None:
         # Debug: Log all messages received
         print(f"[DEBUG] Message received from {message.author}: {message.content[:50] if message.content else '(empty)'}...")
         
-        # Ignore bot messages
+        # Handle DMs separately (only from humans)
+        if not message.guild:
+            if not message.author.bot:
+                await handle_dm(message)
+            return
+        
+        # Save ALL messages to PostgreSQL (including bot messages for recall)
+        save_message_to_db(message)
+        
+        # Don't process bot messages further (no responses to self)
         if message.author.bot:
             return
-        
-        # Handle DMs separately
-        if not message.guild:
-            await handle_dm(message)
-            return
-        
-        # Save directly to PostgreSQL (bypasses Celery/Redis)
-        save_message_to_db(message)
         
         # Check if bot was mentioned (user mention or role mention with bot's name)
         bot_mentioned = (

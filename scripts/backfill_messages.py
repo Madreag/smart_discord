@@ -135,8 +135,7 @@ class BackfillBot(discord.Client):
                     count = 0
                     
                     async for message in channel.history(limit=self.limit_per_channel):
-                        if message.author.bot:
-                            continue
+                        # Include bot messages so we can recall past answers
                         if save_message(conn, message):
                             count += 1
                             self.total_saved += 1

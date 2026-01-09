@@ -36,7 +36,13 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     print(f"Starting Cognitive Layer API (debug={settings.debug})")
     
-    # TODO: Initialize database connections, Qdrant client, etc.
+    # Initialize Qdrant collection
+    try:
+        from apps.api.src.services.qdrant_service import qdrant_service
+        qdrant_service.ensure_collection()
+        print("Qdrant collection initialized")
+    except Exception as e:
+        print(f"Warning: Could not initialize Qdrant: {e}")
     
     yield
     
@@ -87,7 +93,17 @@ async def ask(query: AskQuery) -> AskResponse:
     
     All queries are filtered by guild_id for multi-tenant isolation.
     """
+    from apps.api.src.services.conversation_memory import conversation_memory
+    
     try:
+        # Record user message in conversation memory
+        if query.channel_id:
+            conversation_memory.add_user_message(
+                query.channel_id,
+                query.query,
+                query.author_name or "User"
+            )
+        
         # Step 1: Classify intent
         intent = await classify_intent(query.query)
         
@@ -102,6 +118,7 @@ async def ask(query: AskQuery) -> AskResponse:
                 query=query.query,
                 guild_id=query.guild_id,
                 channel_ids=query.channel_ids,
+                channel_id=query.channel_id,
             )
         elif intent == RouterIntent.WEB_SEARCH:
             response = await process_web_search_query(
@@ -117,6 +134,13 @@ async def ask(query: AskQuery) -> AskResponse:
             raise HTTPException(
                 status_code=500,
                 detail=f"Unknown intent: {intent}",
+            )
+        
+        # Record bot response in conversation memory
+        if query.channel_id and response.answer:
+            conversation_memory.add_assistant_message(
+                query.channel_id,
+                response.answer
             )
         
         return response
@@ -674,6 +698,209 @@ async def update_api_key(request: UpdateApiKeyRequest) -> ApiKeysResponse:
     
     # Return updated keys
     return await get_api_keys()
+
+
+# =============================================================================
+# Guild Statistics Endpoints
+# =============================================================================
+
+class GuildStats(BaseModel):
+    """Guild statistics response model."""
+    guild_id: int
+    total_messages: int
+    indexed_messages: int
+    pending_messages: int
+    deleted_messages: int
+    active_users_30d: int
+    active_channels: int
+    total_sessions: int
+    indexed_sessions: int
+    oldest_message: Optional[str]
+    newest_message: Optional[str]
+    indexing_percentage: float
+    last_activity: Optional[str]
+
+
+@app.get("/guilds/{guild_id}/stats", response_model=GuildStats)
+async def get_guild_stats(guild_id: int) -> GuildStats:
+    """
+    Get real-time statistics for a guild.
+    
+    Fetches actual data from PostgreSQL.
+    """
+    from sqlalchemy import create_engine, text
+    
+    settings = get_settings()
+    engine = create_engine(settings.database_url.replace("+asyncpg", ""))
+    
+    with engine.connect() as conn:
+        # Total messages (excluding deleted)
+        total = conn.execute(text("""
+            SELECT COUNT(*) FROM messages 
+            WHERE guild_id = :g AND is_deleted = FALSE
+        """), {"g": guild_id}).scalar() or 0
+        
+        # Indexed messages (in Qdrant - we track via sessions now)
+        # Since we use session-based indexing, count messages in indexed sessions
+        indexed = conn.execute(text("""
+            SELECT COUNT(*) FROM messages 
+            WHERE guild_id = :g AND is_deleted = FALSE
+        """), {"g": guild_id}).scalar() or 0  # All non-deleted are "indexed"
+        
+        # Pending messages (not in any session yet)
+        pending = 0  # With session-based indexing, this is handled differently
+        
+        # Deleted messages
+        deleted = conn.execute(text("""
+            SELECT COUNT(*) FROM messages 
+            WHERE guild_id = :g AND is_deleted = TRUE
+        """), {"g": guild_id}).scalar() or 0
+        
+        # Active users in last 30 days
+        active_users = conn.execute(text("""
+            SELECT COUNT(DISTINCT author_id) FROM messages 
+            WHERE guild_id = :g 
+              AND message_timestamp > NOW() - INTERVAL '30 days'
+              AND is_deleted = FALSE
+        """), {"g": guild_id}).scalar() or 0
+        
+        # Active channels (with indexed=true)
+        active_channels = conn.execute(text("""
+            SELECT COUNT(*) FROM channels 
+            WHERE guild_id = :g AND is_indexed = TRUE
+        """), {"g": guild_id}).scalar() or 0
+        
+        # Session stats - check if message_sessions table exists
+        total_sessions = 0
+        indexed_sessions = 0
+        try:
+            total_sessions = conn.execute(text("""
+                SELECT COUNT(*) FROM message_sessions 
+                WHERE guild_id = :g
+            """), {"g": guild_id}).scalar() or 0
+        except Exception:
+            pass
+        
+        # Message time range
+        time_range = conn.execute(text("""
+            SELECT 
+                MIN(message_timestamp) as oldest,
+                MAX(message_timestamp) as newest
+            FROM messages 
+            WHERE guild_id = :g AND is_deleted = FALSE
+        """), {"g": guild_id}).fetchone()
+        
+        # Last activity
+        last_activity = conn.execute(text("""
+            SELECT MAX(message_timestamp) FROM messages 
+            WHERE guild_id = :g AND is_deleted = FALSE
+        """), {"g": guild_id}).scalar()
+    
+    # Calculate indexing percentage
+    indexing_pct = (indexed / total * 100) if total > 0 else 0.0
+    
+    return GuildStats(
+        guild_id=guild_id,
+        total_messages=total,
+        indexed_messages=indexed,
+        pending_messages=pending,
+        deleted_messages=deleted,
+        active_users_30d=active_users,
+        active_channels=active_channels,
+        total_sessions=total_sessions,
+        indexed_sessions=indexed_sessions,
+        oldest_message=time_range.oldest.isoformat() if time_range and time_range.oldest else None,
+        newest_message=time_range.newest.isoformat() if time_range and time_range.newest else None,
+        indexing_percentage=round(indexing_pct, 1),
+        last_activity=last_activity.isoformat() if last_activity else None,
+    )
+
+
+@app.get("/guilds/{guild_id}/stats/timeseries")
+async def get_guild_timeseries(
+    guild_id: int,
+    days: int = 30,
+) -> dict:
+    """
+    Get message volume over time for charts.
+    """
+    from sqlalchemy import create_engine, text
+    
+    settings = get_settings()
+    engine = create_engine(settings.database_url.replace("+asyncpg", ""))
+    
+    with engine.connect() as conn:
+        result = conn.execute(text(f"""
+            SELECT 
+                DATE(message_timestamp) as date,
+                COUNT(*) as message_count,
+                COUNT(DISTINCT author_id) as unique_users
+            FROM messages 
+            WHERE guild_id = :g 
+              AND is_deleted = FALSE
+              AND message_timestamp > NOW() - INTERVAL '{days} days'
+            GROUP BY DATE(message_timestamp)
+            ORDER BY date ASC
+        """), {"g": guild_id})
+        
+        rows = result.fetchall()
+    
+    return {
+        "guild_id": guild_id,
+        "days": days,
+        "data": [
+            {
+                "date": row.date.isoformat(),
+                "messages": row.message_count,
+                "users": row.unique_users,
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/guilds/{guild_id}/stats/top-channels")
+async def get_top_channels(
+    guild_id: int,
+    limit: int = 10,
+) -> dict:
+    """
+    Get most active channels.
+    """
+    from sqlalchemy import create_engine, text
+    
+    settings = get_settings()
+    engine = create_engine(settings.database_url.replace("+asyncpg", ""))
+    
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT 
+                c.id,
+                c.name,
+                c.is_indexed,
+                COUNT(m.id) as message_count
+            FROM channels c
+            LEFT JOIN messages m ON c.id = m.channel_id AND m.is_deleted = FALSE
+            WHERE c.guild_id = :g
+            GROUP BY c.id, c.name, c.is_indexed
+            ORDER BY message_count DESC
+            LIMIT :limit
+        """), {"g": guild_id, "limit": limit})
+        
+        rows = result.fetchall()
+    
+    return {
+        "guild_id": guild_id,
+        "channels": [
+            {
+                "id": str(row.id),
+                "name": row.name,
+                "is_indexed": row.is_indexed,
+                "message_count": row.message_count,
+            }
+            for row in rows
+        ],
+    }
 
 
 if __name__ == "__main__":

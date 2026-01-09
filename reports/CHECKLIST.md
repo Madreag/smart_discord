@@ -7,7 +7,7 @@
 
 ## P0 - Critical Priority
 
-### RBAC Permission Check (REPORT1)
+### RBAC Permission Check (REPORT1) DONE
 - [ ] Create `apps/web/src/types/discord.ts` with permission types
 - [ ] Create `apps/web/src/lib/permissions.ts` with bitfield utilities
 - [ ] Update `apps/web/src/app/dashboard/page.tsx` with guild filtering
@@ -16,7 +16,7 @@
 - [ ] Add integration tests for RBAC flow
 - [ ] Test with real Discord accounts (admin vs member)
 
-### Qdrant Vector Indexing Pipeline (REPORT2)
+### Qdrant Vector Indexing Pipeline (REPORT2) DONE
 - [ ] Add dependencies: `qdrant-client`, `fastembed`
 - [ ] Create `apps/api/src/services/embedding_service.py`
 - [ ] Create `apps/api/src/services/qdrant_service.py`

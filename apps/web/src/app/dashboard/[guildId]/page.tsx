@@ -4,6 +4,11 @@ import { ChannelToggle } from "@/components/ChannelToggle";
 import { PrePromptEditor } from "@/components/PrePromptEditor";
 import { canManageGuildById } from "@/lib/permissions";
 import type { DiscordGuild } from "@/types/discord";
+import { getGuildStats, getGuildTimeseries, getTopChannels } from "@/lib/api";
+import { StatsCard } from "@/components/stats-card";
+import { IndexingProgress } from "@/components/indexing-progress";
+import { ActivityChart } from "@/components/activity-chart";
+import { ChannelList } from "@/components/channel-list";
 
 interface Channel {
   id: string;
@@ -79,6 +84,24 @@ export default async function GuildPage({ params }: GuildPageProps) {
 
   const { channels, error } = await getGuildChannels(guildId);
 
+  // Fetch real analytics data
+  let stats = null;
+  let timeseries = null;
+  let topChannels = null;
+  let statsError = null;
+
+  try {
+    [stats, timeseries, topChannels] = await Promise.all([
+      getGuildStats(guildId),
+      getGuildTimeseries(guildId, 30),
+      getTopChannels(guildId, 5),
+    ]);
+  } catch (e) {
+    statsError = "Could not load analytics data";
+  }
+
+  const formatNumber = (n: number) => n.toLocaleString();
+
   return (
     <main className="min-h-screen bg-discord-darkest">
       {/* Header */}
@@ -141,20 +164,78 @@ export default async function GuildPage({ params }: GuildPageProps) {
         </div>
 
         {/* Stats Section */}
-        <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="bg-discord-darker rounded-lg p-6">
-            <h3 className="text-gray-400 text-sm font-medium">Total Messages</h3>
-            <p className="text-3xl font-bold text-white mt-2">12,345</p>
+        {statsError ? (
+          <div className="mt-8 bg-yellow-900/20 border border-yellow-500/30 rounded-lg p-4">
+            <p className="text-yellow-400">{statsError}</p>
           </div>
-          <div className="bg-discord-darker rounded-lg p-6">
-            <h3 className="text-gray-400 text-sm font-medium">Indexed Messages</h3>
-            <p className="text-3xl font-bold text-discord-green mt-2">8,901</p>
+        ) : stats ? (
+          <div className="mt-8 space-y-6">
+            {/* Overview Stats */}
+            <section>
+              <h2 className="text-lg font-semibold text-white mb-4">Overview</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                <StatsCard
+                  title="Total Messages"
+                  value={formatNumber(stats.total_messages)}
+                  subtitle={stats.oldest_message ? `Since ${new Date(stats.oldest_message).toLocaleDateString()}` : undefined}
+                />
+                <StatsCard
+                  title="Indexed Messages"
+                  value={formatNumber(stats.indexed_messages)}
+                  subtitle={`${stats.indexing_percentage}% indexed`}
+                  trend={stats.indexing_percentage >= 90 ? "up" : "neutral"}
+                />
+                <StatsCard
+                  title="Active Users"
+                  value={formatNumber(stats.active_users_30d)}
+                  subtitle="Last 30 days"
+                />
+                <StatsCard
+                  title="Active Channels"
+                  value={formatNumber(stats.active_channels)}
+                  subtitle="Indexing enabled"
+                />
+              </div>
+            </section>
+
+            {/* Indexing Progress */}
+            <section>
+              <h2 className="text-lg font-semibold text-white mb-4">Indexing Status</h2>
+              <IndexingProgress
+                indexed={stats.indexed_messages}
+                pending={stats.pending_messages}
+                total={stats.total_messages}
+                sessions={{
+                  indexed: stats.indexed_sessions,
+                  total: stats.total_sessions,
+                }}
+              />
+            </section>
+
+            {/* Activity Chart */}
+            {timeseries && timeseries.data.length > 0 && (
+              <section>
+                <h2 className="text-lg font-semibold text-white mb-4">Activity (Last 30 Days)</h2>
+                <ActivityChart data={timeseries.data} />
+              </section>
+            )}
+
+            {/* Top Channels */}
+            {topChannels && topChannels.channels.length > 0 && (
+              <section>
+                <h2 className="text-lg font-semibold text-white mb-4">Most Active Channels</h2>
+                <ChannelList channels={topChannels.channels} />
+              </section>
+            )}
+
+            {/* Last Activity */}
+            {stats.last_activity && (
+              <p className="text-sm text-gray-500 text-right">
+                Last activity: {new Date(stats.last_activity).toLocaleString()}
+              </p>
+            )}
           </div>
-          <div className="bg-discord-darker rounded-lg p-6">
-            <h3 className="text-gray-400 text-sm font-medium">Active Users</h3>
-            <p className="text-3xl font-bold text-discord-blurple mt-2">156</p>
-          </div>
-        </div>
+        ) : null}
       </div>
     </main>
   );

@@ -45,57 +45,28 @@ async def search_vectors(
         collection_name: Qdrant collection to search
         limit: Maximum number of results
         channel_ids: Optional list of channel IDs to filter
-        qdrant_client: Optional Qdrant client instance
+        qdrant_client: Optional Qdrant client instance (ignored, uses service)
         
     Returns:
         List of search results with payloads and scores
     """
-    if qdrant_client is None:
-        # Return empty results if no client (for testing)
-        return []
-    
     try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        
-        # Build filter with REQUIRED guild_id
-        must_conditions = [
-            FieldCondition(
-                key="guild_id",
-                match=MatchValue(value=guild_id),
-            )
-        ]
-        
-        # Add optional channel filter
-        if channel_ids:
-            must_conditions.append(
-                FieldCondition(
-                    key="channel_id",
-                    match=MatchValue(value=channel_ids[0]),  # Simplified for now
-                )
-            )
-        
-        query_filter = Filter(must=must_conditions)
+        from apps.api.src.services.qdrant_service import qdrant_service
+        from apps.api.src.core.llm_factory import get_embedding_model
         
         # Get embedding for query
-        embedding = await _get_embedding(query)
+        embedding_model = get_embedding_model()
+        query_embedding = embedding_model.embed_query(query)
         
-        # Search Qdrant
-        results = qdrant_client.search(
-            collection_name=collection_name,
-            query_vector=embedding,
-            query_filter=query_filter,
+        # Search Qdrant with multi-tenant filter
+        results = qdrant_service.search(
+            query_embedding=query_embedding,
+            guild_id=guild_id,
+            channel_ids=channel_ids,
             limit=limit,
-            with_payload=True,
         )
         
-        return [
-            {
-                "id": str(hit.id),
-                "score": hit.score,
-                "payload": hit.payload,
-            }
-            for hit in results
-        ]
+        return results
         
     except Exception as e:
         print(f"Vector search error: {e}")
@@ -123,6 +94,7 @@ async def generate_rag_response(
     query: str,
     context_chunks: list[dict[str, Any]],
     guild_id: int,
+    conversation_context: str = "",
 ) -> str:
     """
     Generate a response using retrieved context.
@@ -131,11 +103,12 @@ async def generate_rag_response(
         query: Original user query
         context_chunks: Retrieved context from vector search
         guild_id: Guild ID for context
+        conversation_context: Recent conversation history for session continuity
         
     Returns:
         Generated response string
     """
-    if not context_chunks:
+    if not context_chunks and not conversation_context:
         return "I couldn't find any relevant discussions matching your query."
     
     try:
@@ -150,25 +123,38 @@ async def generate_rag_response(
         
         llm = get_llm(temperature=0.3)
         
-        # Format context
-        context_text = "\n\n".join([
-            f"[Relevance: {chunk['score']:.2f}]\n{chunk['payload'].get('summary', chunk['payload'].get('content', ''))}"
-            for chunk in context_chunks
-        ])
+        # Format context from vector search
+        context_text = ""
+        if context_chunks:
+            context_text = "\n\n".join([
+                f"[Relevance: {chunk['score']:.2f}]\n{chunk['payload'].get('summary', chunk['payload'].get('content', ''))}"
+                for chunk in context_chunks
+            ])
         
         # Fetch guild pre-prompt for personality injection
         from apps.api.src.core.pre_prompt import get_guild_pre_prompt
         pre_prompt = get_guild_pre_prompt(guild_id)
         pre_prompt_section = f"\n\n{pre_prompt}" if pre_prompt else ""
         
+        # Add conversation context section
+        conversation_section = ""
+        if conversation_context:
+            conversation_section = f"\n\nRecent conversation in this channel:\n{conversation_context}"
+        
         system_prompt = f"""You are a helpful assistant analyzing Discord community discussions.
 Based on the retrieved context from the community's message history, answer the user's question.
 Be concise and cite specific discussions when relevant.
-If the context doesn't contain enough information, say so.{pre_prompt_section}"""
+If the context doesn't contain enough information, say so.
+You can reference your previous answers in the current conversation if relevant.{pre_prompt_section}"""
+
+        user_content = f"Context from message history:\n{context_text}" if context_text else ""
+        if conversation_section:
+            user_content += conversation_section
+        user_content += f"\n\nQuestion: {query}"
 
         response = await llm.ainvoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Context:\n{context_text}\n\nQuestion: {query}"),
+            HumanMessage(content=user_content),
         ])
         
         return response.content.strip()
@@ -199,6 +185,7 @@ async def process_rag_query(
     guild_id: int,
     channel_ids: Optional[list[int]] = None,
     qdrant_client: Optional[Any] = None,
+    channel_id: Optional[int] = None,
 ) -> AskResponse:
     """
     Process a semantic/RAG query and return formatted response.
@@ -217,6 +204,15 @@ async def process_rag_query(
     import time
     start_time = time.time()
     
+    # Get conversation context if channel_id provided
+    conversation_context = ""
+    if channel_id:
+        try:
+            from apps.api.src.services.conversation_memory import conversation_memory
+            conversation_context = conversation_memory.get_context(channel_id, max_messages=5)
+        except Exception:
+            pass
+    
     # Search for relevant content
     results = await search_vectors(
         query=query,
@@ -226,7 +222,7 @@ async def process_rag_query(
     )
     
     # Generate response from context
-    answer = await generate_rag_response(query, results, guild_id)
+    answer = await generate_rag_response(query, results, guild_id, conversation_context)
     
     # Convert results to MessageSource format
     sources = []
