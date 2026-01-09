@@ -53,6 +53,11 @@ async def process_general_knowledge_query(
         
         current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         
+        # Fetch guild pre-prompt for personality injection
+        from apps.api.src.core.pre_prompt import get_guild_pre_prompt
+        pre_prompt = get_guild_pre_prompt(guild_id)
+        pre_prompt_section = f"\n\n{pre_prompt}" if pre_prompt else ""
+        
         system_prompt = f"""You are a helpful Discord bot assistant that answers questions clearly and concisely.
 
 IMPORTANT: You have access to the current date and time. When asked about the time, date, or day, USE THIS INFORMATION:
@@ -60,7 +65,7 @@ Current date and time: {current_time}
 
 For time-related questions, provide the answer using the timestamp above. Convert to the user's likely timezone if they mention one, otherwise give UTC time.
 
-For factual questions, provide accurate answers based on your knowledge. If you're genuinely uncertain about something, say so."""
+For factual questions, provide accurate answers based on your knowledge. If you're genuinely uncertain about something, say so.{pre_prompt_section}"""
 
         response = await llm.ainvoke([
             SystemMessage(content=system_prompt),

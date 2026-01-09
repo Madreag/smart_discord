@@ -1,6 +1,7 @@
 import { auth } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import { ChannelToggle } from "@/components/ChannelToggle";
+import { PrePromptEditor } from "@/components/PrePromptEditor";
 
 interface Channel {
   id: string;
@@ -80,6 +81,11 @@ export default async function GuildPage({ params }: GuildPageProps) {
             </p>
           </div>
         )}
+
+        {/* Pre-Prompt Editor */}
+        <div className="mb-6">
+          <PrePromptEditor guildId={guildId} />
+        </div>
         
         <div className="bg-discord-darker rounded-lg overflow-hidden">
           <div className="px-6 py-4 border-b border-gray-800">

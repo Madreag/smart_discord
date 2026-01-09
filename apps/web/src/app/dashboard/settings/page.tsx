@@ -9,11 +9,12 @@ interface ProviderSettings {
   embedding_model: string;
   has_api_key: boolean;
   available_providers: string[];
+  available_models: Record<string, string[]>;
 }
 
 const providerLabels: Record<string, string> = {
-  openai: "OpenAI (GPT-4o)",
-  anthropic: "Anthropic (Claude)",
+  openai: "OpenAI",
+  anthropic: "Anthropic",
   xai: "xAI (Grok)",
 };
 
@@ -25,24 +26,64 @@ const embeddingLabels: Record<string, string> = {
 export default function SettingsPage() {
   const [settings, setSettings] = useState<ProviderSettings | null>(null);
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saved" | "error">("idle");
+
+  const fetchSettings = async () => {
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+      const response = await fetch(`${apiUrl}/settings/provider`);
+      if (!response.ok) throw new Error("Failed to fetch settings");
+      const data = await response.json();
+      setSettings(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    async function fetchSettings() {
-      try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-        const response = await fetch(`${apiUrl}/settings/provider`);
-        if (!response.ok) throw new Error("Failed to fetch settings");
-        const data = await response.json();
-        setSettings(data);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Unknown error");
-      } finally {
-        setLoading(false);
-      }
-    }
     fetchSettings();
   }, []);
+
+  const updateSettings = async (updates: { llm_provider?: string; llm_model?: string }) => {
+    setSaving(true);
+    setSaveStatus("idle");
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+      const response = await fetch(`${apiUrl}/settings/provider`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updates),
+      });
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.detail || "Failed to update settings");
+      }
+      const data = await response.json();
+      setSettings(data);
+      setSaveStatus("saved");
+      setTimeout(() => setSaveStatus("idle"), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unknown error");
+      setSaveStatus("error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleProviderChange = (newProvider: string) => {
+    if (!settings) return;
+    // When changing provider, also set the first available model for that provider
+    const firstModel = settings.available_models[newProvider]?.[0];
+    updateSettings({ llm_provider: newProvider, llm_model: firstModel });
+  };
+
+  const handleModelChange = (newModel: string) => {
+    updateSettings({ llm_model: newModel });
+  };
 
   return (
     <main className="min-h-screen bg-discord-darkest">
@@ -96,8 +137,9 @@ export default function SettingsPage() {
                   <div className="relative">
                     <select
                       value={settings.llm_provider}
-                      disabled
-                      className="w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-not-allowed opacity-75"
+                      onChange={(e) => handleProviderChange(e.target.value)}
+                      disabled={saving}
+                      className={`w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-pointer hover:border-gray-600 focus:border-discord-blurple focus:outline-none transition-colors ${saving ? "opacity-50 cursor-wait" : ""}`}
                     >
                       {settings.available_providers.map((provider) => (
                         <option key={provider} value={provider}>
@@ -111,12 +153,38 @@ export default function SettingsPage() {
                       </svg>
                     </div>
                   </div>
-                  <p className="text-xs text-gray-500 mt-2">
-                    Current model: <span className="text-gray-400">{settings.llm_model}</span>
-                  </p>
-                  <p className="text-xs text-yellow-500/80 mt-1">
-                    To change provider, update LLM_PROVIDER in your .env file
-                  </p>
+                </div>
+
+                {/* Model Selection */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    Model
+                  </label>
+                  <div className="relative">
+                    <select
+                      value={settings.llm_model}
+                      onChange={(e) => handleModelChange(e.target.value)}
+                      disabled={saving}
+                      className={`w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-pointer hover:border-gray-600 focus:border-discord-blurple focus:outline-none transition-colors ${saving ? "opacity-50 cursor-wait" : ""}`}
+                    >
+                      {settings.available_models[settings.llm_provider]?.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="absolute inset-y-0 right-0 flex items-center px-3 pointer-events-none">
+                      <svg className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </div>
+                  </div>
+                  {saveStatus === "saved" && (
+                    <p className="text-xs text-green-400 mt-2">Settings saved!</p>
+                  )}
+                  {saveStatus === "error" && (
+                    <p className="text-xs text-red-400 mt-2">Error saving settings</p>
+                  )}
                 </div>
 
                 {/* API Key Status */}
@@ -124,23 +192,26 @@ export default function SettingsPage() {
                   <label className="block text-sm font-medium text-gray-300 mb-2">
                     API Key Status
                   </label>
-                  <div className={`flex items-center gap-2 px-4 py-3 rounded-lg ${
+                  <div className={`flex items-center justify-between px-4 py-3 rounded-lg ${
                     settings.has_api_key 
                       ? "bg-green-900/20 border border-green-500/30" 
                       : "bg-red-900/20 border border-red-500/30"
                   }`}>
-                    <div className={`h-3 w-3 rounded-full ${
-                      settings.has_api_key ? "bg-green-500" : "bg-red-500"
-                    }`}></div>
-                    <span className={settings.has_api_key ? "text-green-400" : "text-red-400"}>
-                      {settings.has_api_key ? "API Key Configured" : "No API Key Found"}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <div className={`h-3 w-3 rounded-full ${
+                        settings.has_api_key ? "bg-green-500" : "bg-red-500"
+                      }`}></div>
+                      <span className={settings.has_api_key ? "text-green-400" : "text-red-400"}>
+                        {settings.has_api_key ? "API Key Configured" : "No API Key Found"}
+                      </span>
+                    </div>
+                    <a
+                      href="/dashboard/api-keys"
+                      className="text-sm text-discord-blurple hover:underline"
+                    >
+                      Manage Keys →
+                    </a>
                   </div>
-                  {!settings.has_api_key && (
-                    <p className="text-xs text-gray-500 mt-2">
-                      Add your API key to the .env file to enable AI features
-                    </p>
-                  )}
                 </div>
 
                 {/* Embedding Provider */}

@@ -221,17 +221,28 @@ async def handle_dm(message: discord.Message) -> None:
     
     print(f"[DM] {message.author}: {question}")
     
+    # Find a mutual guild with the user for pre-prompt injection
+    mutual_guild_id = None
+    for guild in bot.guilds:
+        if guild.get_member(user_id):
+            mutual_guild_id = guild.id
+            break
+    
     # Show typing indicator while processing
     async with message.channel.typing():
         try:
             # Call API - memory storage happens server-side
+            payload = {
+                "user_id": user_id,
+                "message": question,
+            }
+            if mutual_guild_id:
+                payload["guild_id"] = mutual_guild_id
+            
             async with httpx.AsyncClient() as client:
                 api_response = await client.post(
                     "http://localhost:8000/chat",
-                    json={
-                        "user_id": user_id,
-                        "message": question,
-                    },
+                    json=payload,
                     timeout=60.0,
                 )
                 api_response.raise_for_status()

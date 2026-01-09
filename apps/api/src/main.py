@@ -155,6 +155,7 @@ class ChatRequest(BaseModel):
     user_id: int
     message: str
     conversation_history: list[dict] = []
+    guild_id: Optional[int] = None  # Optional: used to inject guild pre-prompt
 
 
 class ChatResponse(BaseModel):
@@ -227,10 +228,27 @@ async def chat(request: ChatRequest) -> ChatResponse:
             server_items = [f"- (#{ctx['channel']}) {ctx['content'][:100]}..." for ctx in server_context]
             memory_context += "\n\nRelevant things you said in server channels:\n" + "\n".join(server_items)
         
+        # Fetch guild pre-prompt if guild_id is provided
+        guild_pre_prompt = ""
+        if request.guild_id:
+            try:
+                from sqlalchemy import create_engine, text as sql_text
+                sync_url = settings.database_url.replace("+asyncpg", "")
+                engine = create_engine(sync_url, pool_pre_ping=True)
+                with engine.connect() as conn:
+                    result = conn.execute(sql_text(
+                        "SELECT pre_prompt FROM guilds WHERE id = :guild_id"
+                    ), {"guild_id": request.guild_id})
+                    row = result.fetchone()
+                    if row and row[0]:
+                        guild_pre_prompt = f"\n\n{row[0]}"
+            except Exception:
+                pass  # Silently ignore pre-prompt fetch errors
+        
         system_prompt = f"""You are a friendly and helpful Discord bot assistant having a conversation.
 You can help with general questions, coding, creative tasks, and more.
 Be conversational and remember context from the conversation.
-Keep responses concise but helpful.
+Keep responses concise but helpful.{guild_pre_prompt}
 
 Current date and time: {current_time}{memory_context}"""
 
@@ -270,6 +288,47 @@ class ProviderInfoResponse(BaseModel):
     embedding_model: str
     has_api_key: bool
     available_providers: list[str]
+    available_models: dict[str, list[str]]
+
+
+class UpdateProviderRequest(BaseModel):
+    """Request to update LLM provider settings."""
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+
+
+# Available models per provider (updated January 2026)
+AVAILABLE_MODELS = {
+    "openai": [
+        "o3",
+        "o3-mini", 
+        "o1",
+        "o1-mini",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+    ],
+    "anthropic": [
+        "claude-opus-4-5-20250929",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20250929",
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-opus-20240229",
+    ],
+    "xai": [
+        "grok-4",
+        "grok-3",
+        "grok-3-mini",
+        "grok-2-latest",
+        "grok-beta",
+    ],
+}
 
 
 @app.get("/settings/provider", response_model=ProviderInfoResponse)
@@ -287,6 +346,48 @@ async def get_provider_settings() -> ProviderInfoResponse:
         embedding_model=info["embedding_model"],
         has_api_key=info["has_api_key"],
         available_providers=["openai", "anthropic", "xai"],
+        available_models=AVAILABLE_MODELS,
+    )
+
+
+@app.put("/settings/provider", response_model=ProviderInfoResponse)
+async def update_provider_settings(request: UpdateProviderRequest) -> ProviderInfoResponse:
+    """
+    Update LLM provider and/or model at runtime.
+    
+    Changes take effect immediately without server restart.
+    """
+    from apps.api.src.core.config import set_runtime_override, LLMProvider
+    
+    settings = get_settings()
+    
+    # Validate and set provider
+    if request.llm_provider:
+        if request.llm_provider not in ["openai", "anthropic", "xai"]:
+            raise HTTPException(status_code=400, detail=f"Invalid provider: {request.llm_provider}")
+        set_runtime_override("llm_provider", request.llm_provider)
+    
+    # Validate and set model
+    if request.llm_model:
+        # Get the current/new provider
+        provider = request.llm_provider or settings.active_llm_provider.value
+        if request.llm_model not in AVAILABLE_MODELS.get(provider, []):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid model '{request.llm_model}' for provider '{provider}'"
+            )
+        set_runtime_override(f"{provider}_model", request.llm_model)
+    
+    # Return updated settings
+    info = get_provider_info()
+    return ProviderInfoResponse(
+        llm_provider=info["llm_provider"],
+        llm_model=info["llm_model"],
+        embedding_provider=info["embedding_provider"],
+        embedding_model=info["embedding_model"],
+        has_api_key=info["has_api_key"],
+        available_providers=["openai", "anthropic", "xai"],
+        available_models=AVAILABLE_MODELS,
     )
 
 
@@ -418,6 +519,161 @@ async def toggle_channel_index(
             status_code=500,
             detail=f"Failed to update channel: {str(e)}",
         )
+
+
+class PrePromptResponse(BaseModel):
+    """Response for guild pre-prompt."""
+    guild_id: str
+    pre_prompt: Optional[str] = None
+
+
+class PrePromptRequest(BaseModel):
+    """Request to update pre-prompt."""
+    pre_prompt: str
+
+
+@app.get("/guilds/{guild_id}/pre-prompt", response_model=PrePromptResponse)
+async def get_pre_prompt(guild_id: str) -> PrePromptResponse:
+    """
+    Get the pre-prompt for a guild.
+    """
+    try:
+        from sqlalchemy import create_engine, text as sql_text
+        
+        settings = get_settings()
+        sync_url = settings.database_url.replace("+asyncpg", "")
+        engine = create_engine(sync_url, pool_pre_ping=True)
+        
+        with engine.connect() as conn:
+            result = conn.execute(sql_text(
+                "SELECT pre_prompt FROM guilds WHERE id = :guild_id"
+            ), {"guild_id": int(guild_id)})
+            row = result.fetchone()
+            
+            pre_prompt = row[0] if row else None
+        
+        return PrePromptResponse(guild_id=guild_id, pre_prompt=pre_prompt)
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch pre-prompt: {str(e)}",
+        )
+
+
+@app.put("/guilds/{guild_id}/pre-prompt", response_model=PrePromptResponse)
+async def set_pre_prompt(guild_id: str, request: PrePromptRequest) -> PrePromptResponse:
+    """
+    Set the pre-prompt for a guild.
+    """
+    try:
+        from sqlalchemy import create_engine, text as sql_text
+        
+        settings = get_settings()
+        sync_url = settings.database_url.replace("+asyncpg", "")
+        engine = create_engine(sync_url, pool_pre_ping=True)
+        
+        with engine.connect() as conn:
+            conn.execute(sql_text("""
+                UPDATE guilds SET pre_prompt = :pre_prompt, updated_at = NOW()
+                WHERE id = :guild_id
+            """), {
+                "guild_id": int(guild_id),
+                "pre_prompt": request.pre_prompt if request.pre_prompt.strip() else None,
+            })
+            conn.commit()
+        
+        return PrePromptResponse(
+            guild_id=guild_id, 
+            pre_prompt=request.pre_prompt if request.pre_prompt.strip() else None
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update pre-prompt: {str(e)}",
+        )
+
+
+class ApiKeyInfo(BaseModel):
+    """Info about an API key (masked for security)."""
+    provider: str
+    label: str
+    is_set: bool
+    masked_value: Optional[str] = None
+
+
+class ApiKeysResponse(BaseModel):
+    """Response with all API keys info."""
+    keys: list[ApiKeyInfo]
+
+
+class UpdateApiKeyRequest(BaseModel):
+    """Request to update an API key."""
+    provider: str
+    api_key: str
+
+
+def mask_api_key(key: Optional[str]) -> Optional[str]:
+    """Mask an API key for display, showing only first 4 and last 4 chars."""
+    if not key or len(key) < 12:
+        return None
+    return f"{key[:4]}...{key[-4:]}"
+
+
+@app.get("/settings/api-keys", response_model=ApiKeysResponse)
+async def get_api_keys() -> ApiKeysResponse:
+    """
+    Get status of all API keys (masked for security).
+    """
+    settings = get_settings()
+    
+    keys = [
+        ApiKeyInfo(
+            provider="openai",
+            label="OpenAI",
+            is_set=bool(settings.get_api_key_for_provider("openai")),
+            masked_value=mask_api_key(settings.get_api_key_for_provider("openai")),
+        ),
+        ApiKeyInfo(
+            provider="anthropic", 
+            label="Anthropic",
+            is_set=bool(settings.get_api_key_for_provider("anthropic")),
+            masked_value=mask_api_key(settings.get_api_key_for_provider("anthropic")),
+        ),
+        ApiKeyInfo(
+            provider="xai",
+            label="xAI (Grok)",
+            is_set=bool(settings.get_api_key_for_provider("xai")),
+            masked_value=mask_api_key(settings.get_api_key_for_provider("xai")),
+        ),
+        ApiKeyInfo(
+            provider="tavily",
+            label="Tavily (Web Search)",
+            is_set=bool(settings.get_api_key_for_provider("tavily")),
+            masked_value=mask_api_key(settings.get_api_key_for_provider("tavily")),
+        ),
+    ]
+    
+    return ApiKeysResponse(keys=keys)
+
+
+@app.put("/settings/api-keys", response_model=ApiKeysResponse)
+async def update_api_key(request: UpdateApiKeyRequest) -> ApiKeysResponse:
+    """
+    Update an API key at runtime.
+    """
+    from apps.api.src.core.config import set_runtime_override
+    
+    valid_providers = ["openai", "anthropic", "xai", "tavily"]
+    if request.provider not in valid_providers:
+        raise HTTPException(status_code=400, detail=f"Invalid provider: {request.provider}")
+    
+    key_name = f"{request.provider}_api_key"
+    set_runtime_override(key_name, request.api_key)
+    
+    # Return updated keys
+    return await get_api_keys()
 
 
 if __name__ == "__main__":

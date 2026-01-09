@@ -22,6 +22,10 @@ class EmbeddingProvider(str, Enum):
     LOCAL = "local"
 
 
+# Runtime overrides for settings that can be changed without restart
+_runtime_overrides: dict[str, str] = {}
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
     
@@ -78,24 +82,48 @@ class Settings(BaseSettings):
         return self.database_readonly_url or self.database_url
     
     @property
+    def active_llm_provider(self) -> LLMProvider:
+        """Get the active LLM provider (runtime override or env)."""
+        if "llm_provider" in _runtime_overrides:
+            return LLMProvider(_runtime_overrides["llm_provider"])
+        return self.llm_provider
+    
+    @property
     def active_llm_api_key(self) -> Optional[str]:
         """Get the API key for the currently selected LLM provider."""
-        if self.llm_provider == LLMProvider.OPENAI:
-            return self.openai_api_key
-        elif self.llm_provider == LLMProvider.ANTHROPIC:
-            return self.anthropic_api_key
-        elif self.llm_provider == LLMProvider.XAI:
-            return self.xai_api_key
+        provider = self.active_llm_provider
+        if provider == LLMProvider.OPENAI:
+            return _runtime_overrides.get("openai_api_key") or self.openai_api_key
+        elif provider == LLMProvider.ANTHROPIC:
+            return _runtime_overrides.get("anthropic_api_key") or self.anthropic_api_key
+        elif provider == LLMProvider.XAI:
+            return _runtime_overrides.get("xai_api_key") or self.xai_api_key
         return None
+    
+    def get_api_key_for_provider(self, provider: str) -> Optional[str]:
+        """Get API key for a specific provider."""
+        key_map = {
+            "openai": _runtime_overrides.get("openai_api_key") or self.openai_api_key,
+            "anthropic": _runtime_overrides.get("anthropic_api_key") or self.anthropic_api_key,
+            "xai": _runtime_overrides.get("xai_api_key") or self.xai_api_key,
+            "tavily": _runtime_overrides.get("tavily_api_key") or self.tavily_api_key,
+        }
+        return key_map.get(provider)
     
     @property
     def active_llm_model(self) -> str:
         """Get the model name for the currently selected LLM provider."""
-        if self.llm_provider == LLMProvider.OPENAI:
+        provider = self.active_llm_provider
+        # Check for runtime model override
+        model_key = f"{provider.value}_model"
+        if model_key in _runtime_overrides:
+            return _runtime_overrides[model_key]
+        # Fall back to env-based model
+        if provider == LLMProvider.OPENAI:
             return self.openai_model
-        elif self.llm_provider == LLMProvider.ANTHROPIC:
+        elif provider == LLMProvider.ANTHROPIC:
             return self.anthropic_model
-        elif self.llm_provider == LLMProvider.XAI:
+        elif provider == LLMProvider.XAI:
             return self.xai_model
         return self.openai_model
 
@@ -109,3 +137,13 @@ def get_settings() -> Settings:
 def clear_settings_cache() -> None:
     """Clear the settings cache (useful when settings change at runtime)."""
     get_settings.cache_clear()
+
+
+def set_runtime_override(key: str, value: str) -> None:
+    """Set a runtime override for a setting."""
+    _runtime_overrides[key] = value
+
+
+def get_runtime_overrides() -> dict[str, str]:
+    """Get all runtime overrides."""
+    return _runtime_overrides.copy()

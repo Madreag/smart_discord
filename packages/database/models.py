@@ -42,6 +42,9 @@ class Guild(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     premium_tier: Mapped[int] = mapped_column(SmallInteger, default=0, nullable=False)
     
+    # Pre-prompt for injecting personality/rules into all bot responses
+    pre_prompt: Mapped[Optional[str]] = mapped_column(Text)
+    
     joined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

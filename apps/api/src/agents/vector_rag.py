@@ -156,10 +156,15 @@ async def generate_rag_response(
             for chunk in context_chunks
         ])
         
-        system_prompt = """You are a helpful assistant analyzing Discord community discussions.
+        # Fetch guild pre-prompt for personality injection
+        from apps.api.src.core.pre_prompt import get_guild_pre_prompt
+        pre_prompt = get_guild_pre_prompt(guild_id)
+        pre_prompt_section = f"\n\n{pre_prompt}" if pre_prompt else ""
+        
+        system_prompt = f"""You are a helpful assistant analyzing Discord community discussions.
 Based on the retrieved context from the community's message history, answer the user's question.
 Be concise and cite specific discussions when relevant.
-If the context doesn't contain enough information, say so."""
+If the context doesn't contain enough information, say so.{pre_prompt_section}"""
 
         response = await llm.ainvoke([
             SystemMessage(content=system_prompt),

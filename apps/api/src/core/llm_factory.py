@@ -26,7 +26,8 @@ def get_llm(
         Configured LLM instance
     """
     settings = get_settings()
-    active_provider = provider or settings.llm_provider
+    active_provider = provider or settings.active_llm_provider
+    active_model = settings.active_llm_model
     
     if active_provider == LLMProvider.OPENAI:
         from langchain_openai import ChatOpenAI
@@ -35,7 +36,7 @@ def get_llm(
             raise ValueError("OPENAI_API_KEY is required when using OpenAI provider")
         
         return ChatOpenAI(
-            model=settings.openai_model,
+            model=active_model,
             temperature=temperature,
             api_key=settings.openai_api_key,
         )
@@ -47,7 +48,7 @@ def get_llm(
             raise ValueError("ANTHROPIC_API_KEY is required when using Anthropic provider")
         
         return ChatAnthropic(
-            model=settings.anthropic_model,
+            model=active_model,
             temperature=temperature,
             api_key=settings.anthropic_api_key,
         )
@@ -60,7 +61,7 @@ def get_llm(
         
         # xAI uses OpenAI-compatible API
         return ChatOpenAI(
-            model=settings.xai_model,
+            model=active_model,
             temperature=temperature,
             api_key=settings.xai_api_key,
             base_url=settings.xai_base_url,
@@ -143,7 +144,7 @@ def get_provider_info() -> dict:
     """Get information about the current LLM configuration."""
     settings = get_settings()
     return {
-        "llm_provider": settings.llm_provider.value,
+        "llm_provider": settings.active_llm_provider.value,
         "llm_model": settings.active_llm_model,
         "embedding_provider": settings.embedding_provider.value,
         "embedding_model": settings.embedding_model,
