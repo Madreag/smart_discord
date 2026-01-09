@@ -1,0 +1,24 @@
+{
+  "name": "smart-discord",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "pnpm --filter @smart-discord/web dev",
+    "dev:api": "pnpm --filter @smart-discord/api dev",
+    "dev:bot": "pnpm --filter @smart-discord/bot dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

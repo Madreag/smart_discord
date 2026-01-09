@@ -1,0 +1,102 @@
+version: "3.8"
+
+services:
+  # PostgreSQL - Source of Truth
+  postgres:
+    image: postgres:16-alpine
+    container_name: smart_discord_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: smart_discord
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./packages/database/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Qdrant - Semantic Index
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: smart_discord_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+
+  # Redis - Task Queue
+  redis:
+    image: redis:7-alpine
+    container_name: smart_discord_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  # FastAPI Cognitive Layer
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: smart_discord_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/smart_discord
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_started
+
+  # Celery Worker
+  celery_worker:
+    build:
+      context: .
+      dockerfile: apps/bot/Dockerfile
+    container_name: smart_discord_celery
+    command: celery -A apps.bot.src.tasks worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/smart_discord
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    depends_on:
+      - redis
+      - postgres
+      - qdrant
+
+  # Next.js Control Plane
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: smart_discord_web
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      AUTH_SECRET: ${AUTH_SECRET}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET}
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:
