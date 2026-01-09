@@ -1,27 +1,29 @@
 import { auth } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
+import { filterManageableGuilds } from "@/lib/permissions";
+import type { DiscordGuild } from "@/types/discord";
 
-interface Guild {
-  id: string;
-  name: string;
-  icon: string | null;
-}
-
-async function getUserGuilds(accessToken: string): Promise<Guild[]> {
+async function getUserGuilds(accessToken: string): Promise<DiscordGuild[]> {
   try {
     const response = await fetch("https://discord.com/api/users/@me/guilds", {
       headers: {
         Authorization: `Bearer ${accessToken}`,
       },
+      next: { revalidate: 60 }, // Cache for 60 seconds to reduce API calls
     });
     
     if (!response.ok) {
+      console.error(`Discord API error: ${response.status}`);
       return [];
     }
     
-    return response.json();
-  } catch {
+    const guilds: DiscordGuild[] = await response.json();
+    
+    // RBAC: Filter to only guilds user can manage (ADMINISTRATOR or MANAGE_GUILD)
+    return filterManageableGuilds(guilds);
+  } catch (error) {
+    console.error("Failed to fetch guilds:", error);
     return [];
   }
 }

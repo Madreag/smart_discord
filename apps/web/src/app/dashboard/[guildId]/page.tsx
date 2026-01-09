@@ -2,6 +2,8 @@ import { auth } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import { ChannelToggle } from "@/components/ChannelToggle";
 import { PrePromptEditor } from "@/components/PrePromptEditor";
+import { canManageGuildById } from "@/lib/permissions";
+import type { DiscordGuild } from "@/types/discord";
 
 interface Channel {
   id: string;
@@ -17,6 +19,19 @@ interface GuildPageProps {
 interface ChannelsResult {
   channels: Channel[];
   error?: string;
+}
+
+async function getUserGuilds(accessToken: string): Promise<DiscordGuild[]> {
+  try {
+    const response = await fetch("https://discord.com/api/users/@me/guilds", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      next: { revalidate: 60 },
+    });
+    if (!response.ok) return [];
+    return response.json();
+  } catch {
+    return [];
+  }
 }
 
 async function getGuildChannels(guildId: string): Promise<ChannelsResult> {
@@ -52,6 +67,16 @@ export default async function GuildPage({ params }: GuildPageProps) {
   }
 
   const { guildId } = await params;
+
+  // RBAC: Server-side permission validation
+  const guilds = await getUserGuilds(session.accessToken);
+  const hasAccess = canManageGuildById(guilds, guildId);
+
+  if (!hasAccess) {
+    // User doesn't have permission - redirect with error
+    redirect("/dashboard?error=unauthorized");
+  }
+
   const { channels, error } = await getGuildChannels(guildId);
 
   return (
