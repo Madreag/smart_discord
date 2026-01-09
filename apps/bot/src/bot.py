@@ -123,6 +123,7 @@ def save_message_to_db(message: "discord.Message") -> bool:
 # Bot setup with required intents
 intents = discord.Intents.default()
 intents.message_content = True
+intents.messages = True  # Required to receive message events
 intents.guilds = True
 intents.members = True
 
@@ -157,26 +158,96 @@ bot = IntelligenceBot()
 # MESSAGE EVENTS (Ingestion)
 # =============================================================================
 
-@bot.event
-async def on_message(message: discord.Message) -> None:
+@bot.listen('on_message')
+async def on_message_handler(message: discord.Message) -> None:
     """
     Handle incoming messages.
     
     Stores message directly in Postgres (bypasses Celery for local dev).
+    Also responds to @mentions.
     """
-    # Ignore bot messages
-    if message.author.bot:
+    try:
+        # Debug: Log all messages received
+        print(f"[DEBUG] Message received from {message.author}: {message.content[:50] if message.content else '(empty)'}...")
+        
+        # Ignore bot messages
+        if message.author.bot:
+            return
+        
+        # Ignore DMs
+        if not message.guild:
+            return
+        
+        # Save directly to PostgreSQL (bypasses Celery/Redis)
+        save_message_to_db(message)
+        
+        # Check if bot was mentioned (user mention or role mention with bot's name)
+        bot_mentioned = (
+            bot.user in message.mentions or 
+            f'<@{bot.user.id}>' in message.content or
+            f'<@!{bot.user.id}>' in message.content
+        )
+        
+        # Also check for role mentions that match bot's name (e.g. @smart_bot role)
+        if not bot_mentioned and message.role_mentions:
+            bot_name_lower = bot.user.name.lower()
+            for role in message.role_mentions:
+                if role.name.lower() == bot_name_lower or 'smart' in role.name.lower():
+                    bot_mentioned = True
+                    break
+        
+        if bot_mentioned:
+            print(f"Bot mentioned by {message.author}: {message.content}")
+            await handle_mention(message)
+            
+    except Exception as e:
+        print(f"[ERROR] on_message error: {e}")
+
+
+async def handle_mention(message: discord.Message) -> None:
+    """
+    Handle @mention of the bot - respond to the question in the message.
+    """
+    # Remove the bot mention from the message to get the question
+    question = message.content
+    for mention in message.mentions:
+        question = question.replace(f'<@{mention.id}>', '').replace(f'<@!{mention.id}>', '')
+    question = question.strip()
+    
+    if not question:
+        await message.reply("Hey! Ask me anything by mentioning me with a question. For example: `@bot What is Python?`")
         return
     
-    # Ignore DMs
-    if not message.guild:
-        return
-    
-    # Save directly to PostgreSQL (bypasses Celery/Redis)
-    save_message_to_db(message)
-    
-    # Process commands if any
-    await bot.process_commands(message)
+    # Show typing indicator while processing
+    async with message.channel.typing():
+        try:
+            # Call API directly
+            async with httpx.AsyncClient() as client:
+                api_response = await client.post(
+                    "http://localhost:8000/ask",
+                    json={
+                        "guild_id": message.guild.id,
+                        "query": question,
+                    },
+                    timeout=60.0,
+                )
+                api_response.raise_for_status()
+                response = api_response.json()
+            
+            answer = response.get("answer", "Sorry, I couldn't process that question.")
+            routed_to = response.get("routed_to", "unknown")
+            
+            # Build embed for nicer formatting
+            embed = discord.Embed(
+                description=answer[:4000],
+                color=discord.Color.blue(),
+            )
+            embed.set_footer(text=f"Routed: {routed_to}")
+            
+            await message.reply(embed=embed)
+            
+        except Exception as e:
+            await message.reply(f"Sorry, I encountered an error: {str(e)}")
 
 
 @bot.event

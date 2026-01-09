@@ -8,6 +8,7 @@ using the LLM's training knowledge to provide answers.
 import sys
 from pathlib import Path
 import time
+from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
 
@@ -50,9 +51,16 @@ async def process_general_knowledge_query(
         
         llm = get_llm(temperature=0.3)
         
-        system_prompt = """You are a helpful assistant that answers factual questions clearly and concisely.
-Provide accurate, informative answers based on your training knowledge.
-If you're not certain about something, say so."""
+        current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        
+        system_prompt = f"""You are a helpful Discord bot assistant that answers questions clearly and concisely.
+
+IMPORTANT: You have access to the current date and time. When asked about the time, date, or day, USE THIS INFORMATION:
+Current date and time: {current_time}
+
+For time-related questions, provide the answer using the timestamp above. Convert to the user's likely timezone if they mention one, otherwise give UTC time.
+
+For factual questions, provide accurate answers based on your knowledge. If you're genuinely uncertain about something, say so."""
 
         response = await llm.ainvoke([
             SystemMessage(content=system_prompt),

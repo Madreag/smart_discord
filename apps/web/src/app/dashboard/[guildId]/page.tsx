@@ -1,5 +1,6 @@
 import { auth } from "@/lib/auth";
 import { redirect } from "next/navigation";
+import { ChannelToggle } from "@/components/ChannelToggle";
 
 interface Channel {
   id: string;
@@ -97,26 +98,13 @@ export default async function GuildPage({ params }: GuildPageProps) {
               </div>
             )}
             {channels.map((channel) => (
-              <div
+              <ChannelToggle
                 key={channel.id}
-                className="px-6 py-4 flex items-center justify-between"
-              >
-                <div className="flex items-center gap-3">
-                  <span className="text-gray-400">#</span>
-                  <span className="text-white">{channel.name}</span>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    defaultChecked={channel.isIndexed}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-discord-blurple"></div>
-                  <span className="ml-3 text-sm text-gray-400">
-                    {channel.isIndexed ? "Indexed" : "Not Indexed"}
-                  </span>
-                </label>
-              </div>
+                channelId={channel.id}
+                channelName={channel.name}
+                guildId={guildId}
+                initialIndexed={channel.isIndexed}
+              />
             ))}
           </div>
         </div>

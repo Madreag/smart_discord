@@ -225,13 +225,27 @@ async def get_guild_channels(guild_id: str) -> list[ChannelResponse]:
             
             channels = response.json()
             
+            # Get indexed status from database
+            indexed_channels = set()
+            try:
+                from sqlalchemy import create_engine, text as sql_text
+                sync_url = settings.database_url.replace("+asyncpg", "")
+                engine = create_engine(sync_url, pool_pre_ping=True)
+                with engine.connect() as conn:
+                    result = conn.execute(sql_text(
+                        "SELECT id FROM channels WHERE guild_id = :guild_id AND is_indexed = TRUE"
+                    ), {"guild_id": int(guild_id)})
+                    indexed_channels = {str(row[0]) for row in result.fetchall()}
+            except Exception:
+                pass  # If DB unavailable, default to not indexed
+            
             # Filter to text channels (type 0) and format response
             text_channels = [
                 ChannelResponse(
                     id=str(ch["id"]),
                     name=ch["name"],
                     type=ch["type"],
-                    isIndexed=False,  # TODO: Check database for indexed status
+                    isIndexed=str(ch["id"]) in indexed_channels,
                 )
                 for ch in channels
                 if ch["type"] == 0  # Text channels only
@@ -246,6 +260,51 @@ async def get_guild_channels(guild_id: str) -> list[ChannelResponse]:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to connect to Discord API: {str(e)}",
+        )
+
+
+class ToggleIndexRequest(BaseModel):
+    """Request to toggle channel indexing."""
+    isIndexed: bool
+
+
+@app.patch("/guilds/{guild_id}/channels/{channel_id}/index")
+async def toggle_channel_index(
+    guild_id: str,
+    channel_id: str,
+    request: ToggleIndexRequest,
+) -> dict:
+    """
+    Toggle the is_indexed flag for a channel.
+    """
+    try:
+        from sqlalchemy import create_engine, text as sql_text
+        
+        settings = get_settings()
+        sync_url = settings.database_url.replace("+asyncpg", "")
+        engine = create_engine(sync_url, pool_pre_ping=True)
+        
+        with engine.connect() as conn:
+            # Upsert the channel with the new indexed status
+            conn.execute(sql_text("""
+                INSERT INTO channels (id, guild_id, name, is_indexed, created_at, updated_at)
+                VALUES (:channel_id, :guild_id, 'unknown', :is_indexed, NOW(), NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    is_indexed = :is_indexed,
+                    updated_at = NOW()
+            """), {
+                "channel_id": int(channel_id),
+                "guild_id": int(guild_id),
+                "is_indexed": request.isIndexed,
+            })
+            conn.commit()
+        
+        return {"success": True, "channelId": channel_id, "isIndexed": request.isIndexed}
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update channel: {str(e)}",
         )
 
 
