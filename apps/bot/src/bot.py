@@ -31,6 +31,8 @@ from packages.shared.python.models import IndexTaskPayload, DeleteTaskPayload
 # Database connection for direct message saving (bypasses Celery)
 _db_engine = None
 
+# Note: DM conversation history is now stored in PostgreSQL + Qdrant (RAG memory)
+
 def get_db_engine():
     """Get or create database engine."""
     global _db_engine
@@ -174,8 +176,9 @@ async def on_message_handler(message: discord.Message) -> None:
         if message.author.bot:
             return
         
-        # Ignore DMs
+        # Handle DMs separately
         if not message.guild:
+            await handle_dm(message)
             return
         
         # Save directly to PostgreSQL (bypasses Celery/Redis)
@@ -202,6 +205,46 @@ async def on_message_handler(message: discord.Message) -> None:
             
     except Exception as e:
         print(f"[ERROR] on_message error: {e}")
+
+
+async def handle_dm(message: discord.Message) -> None:
+    """
+    Handle Direct Messages with RAG-based long-term memory.
+    
+    Memory is stored in PostgreSQL + Qdrant for semantic retrieval.
+    """
+    user_id = message.author.id
+    question = message.content.strip()
+    
+    if not question:
+        return
+    
+    print(f"[DM] {message.author}: {question}")
+    
+    # Show typing indicator while processing
+    async with message.channel.typing():
+        try:
+            # Call API - memory storage happens server-side
+            async with httpx.AsyncClient() as client:
+                api_response = await client.post(
+                    "http://localhost:8000/chat",
+                    json={
+                        "user_id": user_id,
+                        "message": question,
+                    },
+                    timeout=60.0,
+                )
+                api_response.raise_for_status()
+                response = api_response.json()
+            
+            answer = response.get("answer", "Sorry, I couldn't process that.")
+            
+            # Send response (no embed for cleaner DM experience)
+            await message.reply(answer[:2000])
+            
+        except Exception as e:
+            print(f"[DM ERROR] {e}")
+            await message.reply(f"Sorry, I encountered an error: {str(e)}")
 
 
 async def handle_mention(message: discord.Message) -> None:
@@ -404,14 +447,51 @@ async def toggle_index(
     """Toggle is_indexed flag for a channel."""
     await interaction.response.defer(ephemeral=True)
     
-    # TODO: Update is_indexed in database
-    # For now, just acknowledge
-    
-    await interaction.followup.send(
-        f"Indexing toggled for {channel.mention}. "
-        f"(Database update not yet implemented)",
-        ephemeral=True,
-    )
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Get current status
+            result = conn.execute(text("""
+                SELECT is_indexed FROM channels WHERE id = :channel_id
+            """), {"channel_id": channel.id})
+            row = result.fetchone()
+            
+            if row is None:
+                # Channel not in DB, insert it with indexing enabled
+                conn.execute(text("""
+                    INSERT INTO channels (id, guild_id, name, is_indexed, created_at, updated_at)
+                    VALUES (:channel_id, :guild_id, :name, TRUE, NOW(), NOW())
+                """), {
+                    "channel_id": channel.id,
+                    "guild_id": interaction.guild.id,
+                    "name": channel.name,
+                })
+                new_status = True
+            else:
+                # Toggle the status
+                current_status = row[0]
+                new_status = not current_status
+                conn.execute(text("""
+                    UPDATE channels SET is_indexed = :new_status, updated_at = NOW()
+                    WHERE id = :channel_id
+                """), {
+                    "channel_id": channel.id,
+                    "new_status": new_status,
+                })
+            
+            conn.commit()
+        
+        status_text = "✅ **Enabled**" if new_status else "❌ **Disabled**"
+        await interaction.followup.send(
+            f"Indexing for {channel.mention}: {status_text}",
+            ephemeral=True,
+        )
+        
+    except Exception as e:
+        await interaction.followup.send(
+            f"Error updating indexing: {str(e)}",
+            ephemeral=True,
+        )
 
 
 # =============================================================================

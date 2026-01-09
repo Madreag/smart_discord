@@ -150,6 +150,118 @@ async def classify(request: ClassifyRequest) -> ClassifyResponse:
     return ClassifyResponse(intent=intent, query=request.query)
 
 
+class ChatRequest(BaseModel):
+    """Request for DM chat with conversation context."""
+    user_id: int
+    message: str
+    conversation_history: list[dict] = []
+
+
+class ChatResponse(BaseModel):
+    """Response for DM chat."""
+    answer: str
+    user_id: int
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest) -> ChatResponse:
+    """
+    Handle DM conversations with RAG-based long-term memory.
+    
+    Stores messages in PostgreSQL and Qdrant for semantic retrieval.
+    """
+    try:
+        from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+        from apps.api.src.core.llm_factory import get_llm
+        from apps.api.src.agents.dm_memory import (
+            store_dm_message, 
+            retrieve_relevant_context,
+            get_recent_messages,
+            get_user_server_context,
+        )
+        from datetime import datetime, timezone
+        
+        settings = get_settings()
+        if not settings.active_llm_api_key:
+            return ChatResponse(
+                answer="I need an LLM API key configured to chat.",
+                user_id=request.user_id,
+            )
+        
+        # Store user message in long-term memory
+        store_dm_message(request.user_id, "user", request.message)
+        
+        # Retrieve relevant past context using RAG
+        relevant_context = retrieve_relevant_context(
+            user_id=request.user_id,
+            query=request.message,
+            limit=5,
+        )
+        
+        # Get relevant server channel context (cross-context)
+        server_context = get_user_server_context(
+            user_id=request.user_id,
+            query=request.message,
+            limit=3,
+        )
+        
+        # Get recent messages for immediate context (last 50 messages)
+        recent_messages = get_recent_messages(request.user_id, limit=50)
+        
+        llm = get_llm(temperature=0.7)
+        
+        current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        
+        # Build context from RAG retrieval (DM history)
+        memory_context = ""
+        if relevant_context:
+            memory_items = []
+            for ctx in relevant_context:
+                if ctx["content"] not in [m.get("content") for m in recent_messages]:
+                    memory_items.append(f"- {ctx['role']}: {ctx['content']}")
+            if memory_items:
+                memory_context = "\n\nRelevant memories from past DM conversations:\n" + "\n".join(memory_items[:3])
+        
+        # Add server channel context
+        if server_context:
+            server_items = [f"- (#{ctx['channel']}) {ctx['content'][:100]}..." for ctx in server_context]
+            memory_context += "\n\nRelevant things you said in server channels:\n" + "\n".join(server_items)
+        
+        system_prompt = f"""You are a friendly and helpful Discord bot assistant having a conversation.
+You can help with general questions, coding, creative tasks, and more.
+Be conversational and remember context from the conversation.
+Keep responses concise but helpful.
+
+Current date and time: {current_time}{memory_context}"""
+
+        # Build message history from recent messages
+        messages = [SystemMessage(content=system_prompt)]
+        
+        # Add recent conversation history (excluding current message)
+        for msg in recent_messages[:-1]:  # Exclude the message we just stored
+            if msg.get("role") == "user":
+                messages.append(HumanMessage(content=msg.get("content", "")))
+            elif msg.get("role") == "assistant":
+                messages.append(AIMessage(content=msg.get("content", "")))
+        
+        # Add current message
+        messages.append(HumanMessage(content=request.message))
+        
+        response = await llm.ainvoke(messages)
+        answer = response.content.strip()
+        
+        # Store assistant response in long-term memory
+        store_dm_message(request.user_id, "assistant", answer)
+        
+        return ChatResponse(answer=answer, user_id=request.user_id)
+        
+    except Exception as e:
+        return ChatResponse(
+            answer=f"Sorry, I encountered an error: {str(e)}",
+            user_id=request.user_id,
+        )
+
+
 class ProviderInfoResponse(BaseModel):
     """Current LLM provider configuration."""
     llm_provider: str
