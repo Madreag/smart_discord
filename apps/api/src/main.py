@@ -24,6 +24,7 @@ from apps.api.src.agents.router import classify_intent
 from apps.api.src.agents.analytics import process_analytics_query
 from apps.api.src.agents.vector_rag import process_rag_query
 from apps.api.src.agents.web_search import process_web_search_query
+from apps.api.src.agents.general_knowledge import process_general_knowledge_query
 from apps.api.src.core.config import get_settings, LLMProvider, EmbeddingProvider
 from apps.api.src.core.llm_factory import get_provider_info
 
@@ -104,6 +105,11 @@ async def ask(query: AskQuery) -> AskResponse:
             )
         elif intent == RouterIntent.WEB_SEARCH:
             response = await process_web_search_query(
+                query=query.query,
+                guild_id=query.guild_id,
+            )
+        elif intent == RouterIntent.GENERAL_KNOWLEDGE:
+            response = await process_general_knowledge_query(
                 query=query.query,
                 guild_id=query.guild_id,
             )

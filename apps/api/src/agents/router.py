@@ -23,15 +23,19 @@ from packages.shared.python.models import RouterIntent
 # Pattern-based classification for common query types
 # These patterns are checked first for fast, deterministic routing
 
+# Discord-related terms that indicate analytics queries about server data
+DISCORD_TERMS = r"(messages?|users?|members?|channels?|server|guild|activity|sent|posted|active)"
+
 ANALYTICS_PATTERNS: list[re.Pattern[str]] = [
-    # Counting/aggregation
-    re.compile(r"\b(how many|count|total|number of)\b", re.IGNORECASE),
+    # Counting/aggregation - MUST mention Discord-related terms
+    re.compile(rf"\b(how many|count|total|number of)\b.*\b{DISCORD_TERMS}\b", re.IGNORECASE),
+    re.compile(rf"\b{DISCORD_TERMS}\b.*\b(how many|count|total|number of)\b", re.IGNORECASE),
     # Ranking/comparison
     re.compile(r"\b(who spoke|most active|least active|top \d+|bottom \d+)\b", re.IGNORECASE),
     re.compile(r"\b(most|least|highest|lowest|average|avg|sum|min|max)\b.*\b(messages?|users?|channels?)\b", re.IGNORECASE),
-    # Time-based statistics
+    # Time-based statistics - MUST mention Discord-related terms
     re.compile(r"\b(messages?|activity)\b.*\b(per|by|each)\b.*\b(day|week|month|hour|user|channel)\b", re.IGNORECASE),
-    re.compile(r"\b(between|from|since|until|last)\b.*\b(am|pm|\d{1,2}:\d{2}|week|month|day)\b", re.IGNORECASE),
+    re.compile(rf"\b(between|from|since|until|last)\b.*\b(am|pm|\d{{1,2}}:\d{{2}}|week|month|day)\b.*\b{DISCORD_TERMS}\b", re.IGNORECASE),
     # Explicit data queries
     re.compile(r"\b(show|list|display|get)\b.*\b(count|stats|statistics|metrics)\b", re.IGNORECASE),
     re.compile(r"\b(message counts?|user counts?|channel stats?)\b", re.IGNORECASE),
@@ -40,6 +44,7 @@ ANALYTICS_PATTERNS: list[re.Pattern[str]] = [
 VECTOR_RAG_PATTERNS: list[re.Pattern[str]] = [
     # Content/topic queries
     re.compile(r"\b(what (was|were|is|are)|summarize|summary of)\b.*\b(said|discussed|talked|mentioned)\b", re.IGNORECASE),
+    re.compile(r"\b(summarize|summary of)\b.*\b(discussion|conversation|chat|thread)\b", re.IGNORECASE),
     re.compile(r"\b(find|search|look for)\b.*\b(messages?|discussions?|conversations?)\b.*\b(about|where|that)\b", re.IGNORECASE),
     re.compile(r"\b(main|common|frequent)\b.*\b(complaints?|issues?|topics?|themes?|concerns?)\b", re.IGNORECASE),
     # Semantic understanding
@@ -90,7 +95,7 @@ async def _classify_with_llm(query: str) -> RouterIntent:
     """
     Use LLM to classify ambiguous queries.
     
-    Falls back to VECTOR_RAG if LLM is unavailable (safe default for Discord context).
+    Falls back to GENERAL_KNOWLEDGE if LLM is unavailable (safe default for unknown queries).
     """
     try:
         from langchain_core.messages import SystemMessage, HumanMessage
@@ -100,22 +105,25 @@ async def _classify_with_llm(query: str) -> RouterIntent:
         
         settings = get_settings()
         if not settings.active_llm_api_key:
-            # No API key - default to vector RAG (semantic search on Discord data)
-            return RouterIntent.VECTOR_RAG
+            # No API key - default to general knowledge (direct LLM answer)
+            return RouterIntent.GENERAL_KNOWLEDGE
         
         llm = get_llm(temperature=0.0)
         
         system_prompt = """You are a query intent classifier for a Discord community analytics system.
 Classify the user's query into exactly ONE of these categories:
 
-- analytics_db: Statistical queries about message counts, user activity, rankings, time-based metrics. 
+- analytics_db: Statistical queries about THIS SERVER's message counts, user activity, rankings, time-based metrics.
   Examples: "Who sent the most messages?", "How many messages last week?", "Most active channel?"
   
-- vector_rag: Semantic content queries about what was discussed, topics, summaries, finding specific discussions.
+- vector_rag: Semantic content queries about what was discussed IN THIS SERVER, topics, summaries, finding specific discussions.
   Examples: "What are the main complaints?", "Summarize the React discussion", "What did John say about the bug?"
   
-- web_search: Queries requiring external/current information not in Discord data.
-  Examples: "Latest Python version?", "How to configure nginx?", "Current Bitcoin price?"
+- web_search: Queries requiring external/current information that needs real-time web search.
+  Examples: "Latest Python version?", "Current Bitcoin price?", "Today's news?"
+
+- general_knowledge: Factual questions that can be answered from general knowledge, NOT about Discord server data.
+  Examples: "How many states are in the US?", "What is the capital of France?", "Who wrote Romeo and Juliet?"
 
 Respond with ONLY the category name, nothing else."""
 
@@ -130,15 +138,17 @@ Respond with ONLY the category name, nothing else."""
             return RouterIntent.ANALYTICS_DB
         elif "web" in intent_str:
             return RouterIntent.WEB_SEARCH
+        elif "general" in intent_str:
+            return RouterIntent.GENERAL_KNOWLEDGE
         else:
             return RouterIntent.VECTOR_RAG
             
     except ImportError:
-        # LangChain not available - default to vector RAG
-        return RouterIntent.VECTOR_RAG
+        # LangChain not available - default to general knowledge
+        return RouterIntent.GENERAL_KNOWLEDGE
     except Exception:
-        # Any other error - default to vector RAG
-        return RouterIntent.VECTOR_RAG
+        # Any other error - default to general knowledge
+        return RouterIntent.GENERAL_KNOWLEDGE
 
 
 async def classify_intent(query: str) -> RouterIntent:

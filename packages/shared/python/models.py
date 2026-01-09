@@ -99,6 +99,7 @@ class RouterIntent(str, Enum):
     ANALYTICS_DB = "analytics_db"
     VECTOR_RAG = "vector_rag"
     WEB_SEARCH = "web_search"
+    GENERAL_KNOWLEDGE = "general_knowledge"
 
 
 class AskQuery(BaseModel):

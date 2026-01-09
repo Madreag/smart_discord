@@ -21,9 +21,103 @@ from discord.ext import commands
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
+import httpx
+from sqlalchemy import create_engine, text
+
 from apps.bot.src.config import get_bot_settings
-from apps.bot.src.tasks import celery_app, index_messages, delete_message_vector, ask_query
 from packages.shared.python.models import IndexTaskPayload, DeleteTaskPayload
+
+
+# Database connection for direct message saving (bypasses Celery)
+_db_engine = None
+
+def get_db_engine():
+    """Get or create database engine."""
+    global _db_engine
+    if _db_engine is None:
+        settings = get_bot_settings()
+        sync_url = settings.database_url.replace("+asyncpg", "")
+        _db_engine = create_engine(sync_url, pool_pre_ping=True)
+    return _db_engine
+
+
+def save_message_to_db(message: "discord.Message") -> bool:
+    """
+    Save a Discord message directly to PostgreSQL.
+    
+    Returns True if successful, False otherwise.
+    """
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Upsert user first
+            conn.execute(text("""
+                INSERT INTO users (id, username, global_name, first_seen_at, updated_at)
+                VALUES (:id, :username, :global_name, NOW(), NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    global_name = EXCLUDED.global_name,
+                    updated_at = NOW()
+            """), {
+                "id": message.author.id,
+                "username": message.author.name,
+                "global_name": message.author.display_name,
+            })
+            
+            # Upsert guild
+            conn.execute(text("""
+                INSERT INTO guilds (id, name, owner_id, joined_at, created_at, updated_at)
+                VALUES (:id, :name, :owner_id, NOW(), NOW(), NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    updated_at = NOW()
+            """), {
+                "id": message.guild.id,
+                "name": message.guild.name,
+                "owner_id": message.guild.owner_id,
+            })
+            
+            # Upsert channel
+            conn.execute(text("""
+                INSERT INTO channels (id, guild_id, name, type, created_at, updated_at)
+                VALUES (:id, :guild_id, :name, :type, NOW(), NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    updated_at = NOW()
+            """), {
+                "id": message.channel.id,
+                "guild_id": message.guild.id,
+                "name": message.channel.name,
+                "type": getattr(message.channel, 'type', 0).value if hasattr(getattr(message.channel, 'type', 0), 'value') else 0,
+            })
+            
+            # Insert message
+            conn.execute(text("""
+                INSERT INTO messages (id, channel_id, guild_id, author_id, content, reply_to_id, 
+                                      attachment_count, embed_count, mention_count, message_timestamp, 
+                                      created_at, updated_at)
+                VALUES (:id, :channel_id, :guild_id, :author_id, :content, :reply_to_id,
+                        :attachment_count, :embed_count, :mention_count, :message_timestamp,
+                        NOW(), NOW())
+                ON CONFLICT (id) DO NOTHING
+            """), {
+                "id": message.id,
+                "channel_id": message.channel.id,
+                "guild_id": message.guild.id,
+                "author_id": message.author.id,
+                "content": message.content or "",
+                "reply_to_id": message.reference.message_id if message.reference else None,
+                "attachment_count": len(message.attachments),
+                "embed_count": len(message.embeds),
+                "mention_count": len(message.mentions),
+                "message_timestamp": message.created_at,
+            })
+            
+            conn.commit()
+            return True
+    except Exception as e:
+        print(f"Error saving message to DB: {e}")
+        return False
 
 
 # Bot setup with required intents
@@ -68,8 +162,7 @@ async def on_message(message: discord.Message) -> None:
     """
     Handle incoming messages.
     
-    Stores message in Postgres and queues for vector indexing
-    if the channel has is_indexed=True.
+    Stores message directly in Postgres (bypasses Celery for local dev).
     """
     # Ignore bot messages
     if message.author.bot:
@@ -79,18 +172,8 @@ async def on_message(message: discord.Message) -> None:
     if not message.guild:
         return
     
-    # TODO: Check if channel.is_indexed in database
-    # For now, we'll push all messages to the task queue
-    
-    # Queue indexing task (non-blocking)
-    payload = IndexTaskPayload(
-        guild_id=message.guild.id,
-        channel_id=message.channel.id,
-        message_ids=[message.id],
-    )
-    
-    # Send to Celery (fire and forget)
-    index_messages.delay(payload.model_dump())
+    # Save directly to PostgreSQL (bypasses Celery/Redis)
+    save_message_to_db(message)
     
     # Process commands if any
     await bot.process_commands(message)
@@ -161,15 +244,19 @@ async def ai_ask(
                 if ch.name.lower() in channel_names
             ]
         
-        # Queue the query task and wait for result
-        result = ask_query.delay(
-            guild_id=interaction.guild.id,
-            query=question,
-            channel_ids=channel_ids,
-        )
-        
-        # Wait for result (with timeout)
-        response = result.get(timeout=60)
+        # Call API directly (bypasses Celery/Redis for simpler local dev)
+        async with httpx.AsyncClient() as client:
+            api_response = await client.post(
+                "http://localhost:8000/ask",
+                json={
+                    "guild_id": interaction.guild.id,
+                    "query": question,
+                    "channel_ids": channel_ids,
+                },
+                timeout=60.0,
+            )
+            api_response.raise_for_status()
+            response = api_response.json()
         
         # Format response
         answer = response.get("answer", "Unable to process query")
@@ -208,13 +295,18 @@ async def stats(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
     
     try:
-        # Quick stats query
-        result = ask_query.delay(
-            guild_id=interaction.guild.id,
-            query="How many messages total and who are the top 5 most active users?",
-        )
-        
-        response = result.get(timeout=30)
+        # Quick stats query via direct API call
+        async with httpx.AsyncClient() as client:
+            api_response = await client.post(
+                "http://localhost:8000/ask",
+                json={
+                    "guild_id": interaction.guild.id,
+                    "query": "How many messages total and who are the top 5 most active users?",
+                },
+                timeout=30.0,
+            )
+            api_response.raise_for_status()
+            response = api_response.json()
         
         embed = discord.Embed(
             title=f"📊 {interaction.guild.name} Statistics",

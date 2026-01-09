@@ -199,6 +199,84 @@ async def execute_analytics_query(
     return (validation, None)
 
 
+async def _execute_with_database(sql: str, guild_id: int) -> Optional[list[dict]]:
+    """
+    Execute SQL query against the database.
+    
+    Returns None if database is unavailable.
+    """
+    try:
+        from sqlalchemy import create_engine, text
+        from apps.api.src.core.config import get_settings
+        
+        settings = get_settings()
+        # Use sync URL for simple queries
+        sync_url = settings.database_url.replace("+asyncpg", "")
+        
+        engine = create_engine(sync_url, pool_pre_ping=True)
+        with engine.connect() as conn:
+            result = conn.execute(text(sql))
+            rows = result.fetchall()
+            columns = result.keys()
+            return [dict(zip(columns, row)) for row in rows]
+    except Exception:
+        return None
+
+
+async def _llm_fallback_answer(query: str, guild_id: int) -> str:
+    """
+    Use LLM to answer analytics questions when database is unavailable.
+    """
+    try:
+        from langchain_core.messages import SystemMessage, HumanMessage
+        from apps.api.src.core.config import get_settings
+        from apps.api.src.core.llm_factory import get_llm
+        
+        settings = get_settings()
+        if not settings.active_llm_api_key:
+            return "Database is not available and no LLM API key is configured."
+        
+        llm = get_llm(temperature=0.3)
+        
+        system_prompt = """You are a helpful Discord bot assistant. The user is asking about server statistics or analytics.
+Unfortunately, the database is not currently available to run queries.
+Politely explain that you cannot retrieve the specific data they requested because the database is offline.
+Suggest they try again later or ask a general knowledge question instead."""
+
+        response = await llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=query),
+        ])
+        
+        return response.content.strip()
+    except Exception as e:
+        return f"Database is unavailable and LLM fallback failed: {str(e)}"
+
+
+def _format_query_results(results: list[dict], query: str) -> str:
+    """Format database query results into a readable response."""
+    if not results:
+        return "No results found for your query."
+    
+    # For single-value results (like COUNT)
+    if len(results) == 1 and len(results[0]) == 1:
+        key, value = list(results[0].items())[0]
+        return f"**{key.replace('_', ' ').title()}**: {value:,}" if isinstance(value, (int, float)) else f"**{key}**: {value}"
+    
+    # For tabular results (like top users)
+    lines = []
+    for i, row in enumerate(results[:10], 1):
+        parts = []
+        for key, value in row.items():
+            if isinstance(value, (int, float)):
+                parts.append(f"{value:,}")
+            else:
+                parts.append(str(value) if value else "N/A")
+        lines.append(f"{i}. " + " - ".join(parts))
+    
+    return "\n".join(lines)
+
+
 async def process_analytics_query(
     query: str,
     guild_id: int,
@@ -208,21 +286,34 @@ async def process_analytics_query(
     
     This is the main entry point for the analytics agent.
     """
-    validation, results = await execute_analytics_query(query, guild_id)
+    import time
+    start_time = time.time()
+    
+    validation, _ = await execute_analytics_query(query, guild_id)
     
     if not validation.is_valid:
         return AskResponse(
             answer=f"Unable to process query: {validation.error}",
             sources=[],
             routed_to=RouterIntent.ANALYTICS_DB,
-            execution_time_ms=0,
+            execution_time_ms=(time.time() - start_time) * 1000,
         )
     
-    # Format results into response
-    # In production, this would format the actual query results
+    # Try to execute against database
+    results = await _execute_with_database(validation.sanitized_sql, guild_id)
+    
+    if results is not None:
+        # Database available - format and return results
+        answer = _format_query_results(results, query)
+    else:
+        # Database unavailable - use LLM fallback
+        answer = await _llm_fallback_answer(query, guild_id)
+    
+    execution_time = (time.time() - start_time) * 1000
+    
     return AskResponse(
-        answer=f"Query generated successfully. SQL: {validation.sanitized_sql}",
+        answer=answer,
         sources=[],
         routed_to=RouterIntent.ANALYTICS_DB,
-        execution_time_ms=0,
+        execution_time_ms=execution_time,
     )
