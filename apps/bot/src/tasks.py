@@ -4,10 +4,17 @@ Celery Tasks for Message Processing
 These tasks run outside the Discord event loop to avoid blocking.
 The bot pushes tasks to Redis/Celery, workers process them asynchronously.
 
+Features:
+- Automatic retry with exponential backoff
+- Priority queues (high, default, low)
+- Dead letter queue for failed tasks
+
 CONSTRAINT: Bot NEVER processes AI logic locally - always via Celery.
 """
 
+import os
 import sys
+import json
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -16,25 +23,14 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from celery import Celery
+from celery.signals import task_failure
 from packages.shared.python.models import IndexTaskPayload, DeleteTaskPayload
 
-# Initialize Celery app
-celery_app = Celery(
-    "smart_discord",
-    broker="redis://localhost:6379/0",
-    backend="redis://localhost:6379/1",
-)
+# Import production config
+from apps.bot.src.celery_config import celery_app
 
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
-    task_track_started=True,
-    task_time_limit=300,  # 5 minute timeout
-    worker_prefetch_multiplier=1,
-)
+# Dead letter queue name
+DEAD_LETTER_QUEUE = "dead_letter"
 
 
 def get_db_engine():
@@ -47,7 +43,15 @@ def get_db_engine():
     return create_engine(sync_url, pool_pre_ping=True)
 
 
-@celery_app.task(bind=True, name="index_messages")
+@celery_app.task(
+    bind=True,
+    name="index_messages",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
 def index_messages(self, payload_dict: dict) -> dict:
     """
     Index messages to Qdrant after storing in PostgreSQL.
@@ -126,7 +130,13 @@ def index_messages(self, payload_dict: dict) -> dict:
     }
 
 
-@celery_app.task(bind=True, name="delete_message_vector")
+@celery_app.task(
+    bind=True,
+    name="delete_message_vector",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    max_retries=3,
+)
 def delete_message_vector(self, payload_dict: dict) -> dict:
     """
     Delete message vector from Qdrant (Right to be Forgotten).
@@ -162,7 +172,15 @@ def delete_message_vector(self, payload_dict: dict) -> dict:
     }
 
 
-@celery_app.task(bind=True, name="process_session")
+@celery_app.task(
+    bind=True,
+    name="process_session",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
 def process_session(
     self,
     guild_id: int,
@@ -254,7 +272,13 @@ def process_session(
     }
 
 
-@celery_app.task(bind=True, name="ask_query")
+@celery_app.task(
+    bind=True,
+    name="ask_query",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    max_retries=3,
+)
 def ask_query(
     self,
     guild_id: int,
@@ -298,3 +322,149 @@ def ask_query(
             "routed_to": "unknown",
             "execution_time_ms": 0,
         }
+
+
+@celery_app.task(
+    bind=True,
+    name="batch_index_channel",
+    time_limit=3600,  # 1 hour max
+)
+def batch_index_channel(
+    self,
+    guild_id: int,
+    channel_id: int,
+    channel_name: str,
+    batch_size: int = 100,
+) -> dict:
+    """
+    Batch index all unindexed messages in a channel.
+    
+    Runs in low-priority queue to not block real-time operations.
+    """
+    from sqlalchemy import text
+    from apps.bot.src.sessionizer import sessionize_messages, Message
+    
+    print(f"[TASK] batch_index_channel: {channel_name}")
+    
+    engine = get_db_engine()
+    
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT id, content, author_id, message_timestamp, reply_to_id
+            FROM messages
+            WHERE guild_id = :g AND channel_id = :c
+              AND is_deleted = FALSE AND qdrant_point_id IS NULL
+              AND content IS NOT NULL AND LENGTH(content) > 0
+            ORDER BY message_timestamp
+            LIMIT :limit
+        """), {"g": guild_id, "c": channel_id, "limit": batch_size})
+        rows = result.fetchall()
+    
+    if not rows:
+        return {"status": "complete", "indexed": 0}
+    
+    # Sessionize
+    messages = [Message(
+        id=r.id,
+        channel_id=channel_id,
+        author_id=r.author_id,
+        content=r.content,
+        timestamp=r.message_timestamp,
+        reply_to_id=r.reply_to_id,
+    ) for r in rows]
+    
+    sessions = sessionize_messages(messages)
+    
+    # Queue each session
+    queued = 0
+    for session in sessions:
+        if len(session.messages) >= 1:
+            session_id = str(uuid4())
+            process_session.apply_async(
+                kwargs={
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "message_ids": session.message_ids,
+                    "start_time": session.start_time.isoformat(),
+                    "end_time": session.end_time.isoformat(),
+                },
+                queue="default",
+            )
+            queued += 1
+    
+    return {
+        "status": "processing",
+        "messages_found": len(rows),
+        "sessions_queued": queued,
+    }
+
+
+# Dead letter queue handler
+@task_failure.connect
+def handle_task_failure(sender=None, task_id=None, exception=None, args=None, kwargs=None, traceback=None, **kw):
+    """
+    Handle permanently failed tasks.
+    
+    Logs to dead letter queue for manual investigation.
+    """
+    import redis
+    
+    try:
+        client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
+        
+        failure_data = {
+            "task_name": sender.name if sender else "unknown",
+            "task_id": task_id,
+            "args": args,
+            "kwargs": kwargs,
+            "exception": str(exception),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        
+        # Push to dead letter queue
+        client.lpush(DEAD_LETTER_QUEUE, json.dumps(failure_data))
+        
+        print(f"[DLQ] Task {task_id} failed permanently: {exception}")
+    except Exception as e:
+        print(f"[DLQ] Failed to log to dead letter queue: {e}")
+
+
+@celery_app.task(name="get_queue_stats")
+def get_queue_stats() -> dict:
+    """Get queue statistics for monitoring."""
+    import redis
+    
+    client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
+    
+    queues = ["high", "default", "low", DEAD_LETTER_QUEUE]
+    stats = {}
+    
+    for queue in queues:
+        stats[queue] = client.llen(queue)
+    
+    return stats
+
+
+@celery_app.task(name="process_dead_letter")
+def process_dead_letter(limit: int = 10) -> dict:
+    """
+    Process items from dead letter queue.
+    
+    Can be used to retry or investigate failures.
+    """
+    import redis
+    
+    client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
+    
+    processed = []
+    for _ in range(limit):
+        item = client.rpop(DEAD_LETTER_QUEUE)
+        if not item:
+            break
+        processed.append(json.loads(item))
+    
+    return {
+        "processed_count": len(processed),
+        "items": processed,
+    }
