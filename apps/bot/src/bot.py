@@ -506,6 +506,201 @@ async def toggle_index(
         )
 
 
+@bot.tree.command(name="summary", description="Summarize recent channel activity")
+@app_commands.describe(
+    channel="Channel to summarize (default: current)",
+    hours="Hours to look back (default: 24, max: 168)",
+)
+async def summary(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+    hours: int = 24,
+) -> None:
+    """Generate a summary of recent channel activity."""
+    await interaction.response.defer(thinking=True)
+    
+    hours = min(max(hours, 1), 168)
+    target_channel = channel or interaction.channel
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            api_response = await client.post(
+                "http://localhost:8000/summary",
+                json={
+                    "guild_id": interaction.guild.id,
+                    "channel_id": target_channel.id,
+                    "hours": hours,
+                },
+                timeout=90.0,
+            )
+            api_response.raise_for_status()
+            data = api_response.json()
+        
+        if data.get("status") == "no_messages":
+            await interaction.followup.send(
+                f"📭 No messages found in {target_channel.mention} in the last {hours} hours.",
+                ephemeral=True,
+            )
+            return
+        
+        embed = discord.Embed(
+            title=f"📋 Summary: #{target_channel.name}",
+            description=data.get("summary", "No summary available")[:4000],
+            color=discord.Color.green(),
+        )
+        
+        embed.add_field(
+            name="📊 Stats",
+            value=f"**Messages**: {data.get('message_count', 0)}\n"
+                  f"**Participants**: {data.get('participant_count', 0)}\n"
+                  f"**Time Range**: Last {hours}h",
+            inline=True,
+        )
+        
+        topics = data.get("topics", [])
+        if topics:
+            embed.add_field(
+                name="🏷️ Key Topics",
+                value=", ".join(topics[:5]),
+                inline=True,
+            )
+        
+        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Error generating summary: {str(e)[:100]}",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="search", description="Search chat history")
+@app_commands.describe(
+    query="Search terms or keywords",
+    channel="Limit search to specific channel (optional)",
+    limit="Max results (default: 5, max: 10)",
+)
+async def search(
+    interaction: discord.Interaction,
+    query: str,
+    channel: Optional[discord.TextChannel] = None,
+    limit: int = 5,
+) -> None:
+    """Search chat history using semantic search."""
+    await interaction.response.defer(thinking=True)
+    
+    limit = min(max(limit, 1), 10)
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            api_response = await client.post(
+                "http://localhost:8000/search",
+                json={
+                    "query": query,
+                    "guild_id": interaction.guild.id,
+                    "channel_id": channel.id if channel else None,
+                    "limit": limit,
+                },
+                timeout=30.0,
+            )
+            api_response.raise_for_status()
+            data = api_response.json()
+        
+        results = data.get("results", [])
+        
+        if not results:
+            await interaction.followup.send(
+                f"🔍 No results found for: **{query}**",
+                ephemeral=True,
+            )
+            return
+        
+        embed = discord.Embed(
+            title=f"🔍 Search Results: {query}",
+            color=discord.Color.blue(),
+        )
+        
+        for i, result in enumerate(results[:limit], 1):
+            content = result.get("content", "")[:200]
+            if len(result.get("content", "")) > 200:
+                content += "..."
+            
+            author = result.get("author", "Unknown")
+            channel_name = result.get("channel", "Unknown")
+            score = result.get("score", 0)
+            
+            embed.add_field(
+                name=f"{i}. {author} in #{channel_name}",
+                value=f"{content}\n*Relevance: {score:.0%}*",
+                inline=False,
+            )
+        
+        embed.set_footer(text=f"Found {len(results)} results")
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Error searching: {str(e)[:100]}",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="topics", description="Show trending topics in the server")
+@app_commands.describe(
+    days="Days to analyze (default: 7, max: 30)",
+)
+async def topics(
+    interaction: discord.Interaction,
+    days: int = 7,
+) -> None:
+    """Show trending topics using keyword extraction."""
+    await interaction.response.defer(thinking=True)
+    
+    days = min(max(days, 1), 30)
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            api_response = await client.get(
+                f"http://localhost:8000/guilds/{interaction.guild.id}/topics",
+                params={"days": days},
+                timeout=60.0,
+            )
+            api_response.raise_for_status()
+            data = api_response.json()
+        
+        topic_list = data.get("topics", [])
+        
+        if not topic_list:
+            await interaction.followup.send(
+                "🏷️ No trending topics found. Try increasing the time range.",
+                ephemeral=True,
+            )
+            return
+        
+        embed = discord.Embed(
+            title=f"🏷️ Trending Topics (Last {days} days)",
+            color=discord.Color.purple(),
+        )
+        
+        topic_lines = []
+        for i, topic in enumerate(topic_list[:10], 1):
+            name = topic.get("name", "Unknown")
+            count = topic.get("count", 0)
+            topic_lines.append(f"{i}. **{name}** ({count} mentions)")
+        
+        embed.description = "\n".join(topic_lines)
+        embed.set_footer(text=f"Analyzed {data.get('message_count', 0)} messages")
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Error fetching topics: {str(e)[:100]}",
+            ephemeral=True,
+        )
+
+
 # =============================================================================
 # ENTRY POINT
 # =============================================================================

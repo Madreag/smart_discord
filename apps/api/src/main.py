@@ -909,6 +909,240 @@ async def get_top_channels(
     }
 
 
+# =============================================================================
+# Slash Command API Endpoints
+# =============================================================================
+
+class SummaryRequest(BaseModel):
+    """Request for channel summary."""
+    guild_id: int
+    channel_id: int
+    hours: int = 24
+
+
+class SummaryResponse(BaseModel):
+    """Response for channel summary."""
+    status: str
+    summary: str
+    message_count: int
+    participant_count: int
+    topics: list[str]
+
+
+@app.post("/summary", response_model=SummaryResponse)
+async def generate_summary(request: SummaryRequest) -> SummaryResponse:
+    """Generate a summary of recent channel activity."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import create_engine, text
+    from collections import Counter
+    import re
+    
+    settings = get_settings()
+    engine = create_engine(settings.database_url.replace("+asyncpg", ""))
+    cutoff = datetime.utcnow() - timedelta(hours=request.hours)
+    
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT m.content, u.username, u.global_name, m.message_timestamp
+            FROM messages m
+            JOIN users u ON m.author_id = u.id
+            WHERE m.guild_id = :guild_id
+              AND m.channel_id = :channel_id
+              AND m.message_timestamp > :cutoff
+              AND m.is_deleted = FALSE
+              AND LENGTH(m.content) > 5
+            ORDER BY m.message_timestamp ASC
+            LIMIT 500
+        """), {
+            "guild_id": request.guild_id,
+            "channel_id": request.channel_id,
+            "cutoff": cutoff,
+        })
+        rows = result.fetchall()
+    
+    if not rows:
+        return SummaryResponse(
+            status="no_messages",
+            summary="",
+            message_count=0,
+            participant_count=0,
+            topics=[],
+        )
+    
+    # Build conversation text
+    messages_text = "\n".join([
+        f"{row.global_name or row.username}: {row.content}"
+        for row in rows
+    ])
+    
+    # Count unique participants
+    participants = set(row.global_name or row.username for row in rows)
+    
+    # Extract topics (keyword extraction)
+    words = re.findall(r'\b[a-zA-Z]{4,15}\b', messages_text.lower())
+    stop_words = {"that", "this", "with", "have", "just", "like", "from", "they", "would", "there", "their", "what", "about"}
+    words = [w for w in words if w not in stop_words]
+    topics = [word for word, _ in Counter(words).most_common(5)]
+    
+    # Generate summary using LLM
+    try:
+        from apps.api.src.core.llm_factory import get_llm
+        from langchain_core.messages import SystemMessage, HumanMessage
+        
+        llm = get_llm(temperature=0.3)
+        
+        response = await llm.ainvoke([
+            SystemMessage(content="You are a helpful assistant that summarizes Discord conversations. "
+                         "Provide a concise 2-3 paragraph summary highlighting main topics discussed, "
+                         "any decisions made, and notable interactions."),
+            HumanMessage(content=f"Summarize this conversation:\n\n{messages_text[:6000]}"),
+        ])
+        
+        summary = response.content.strip()
+    except Exception as e:
+        summary = f"Could not generate summary: {str(e)[:100]}"
+    
+    return SummaryResponse(
+        status="success",
+        summary=summary,
+        message_count=len(rows),
+        participant_count=len(participants),
+        topics=topics,
+    )
+
+
+class SearchRequest(BaseModel):
+    """Request for message search."""
+    query: str
+    guild_id: int
+    channel_id: Optional[int] = None
+    user_id: Optional[int] = None
+    limit: int = 5
+
+
+class SearchResult(BaseModel):
+    """Single search result."""
+    content: str
+    author: str
+    channel: str
+    timestamp: str
+    score: float
+
+
+class SearchResponse(BaseModel):
+    """Response for message search."""
+    results: list[SearchResult]
+
+
+@app.post("/search", response_model=SearchResponse)
+async def search_messages(request: SearchRequest) -> SearchResponse:
+    """Semantic search across chat history."""
+    from apps.api.src.core.llm_factory import get_embedding_model
+    from apps.api.src.services.qdrant_service import qdrant_service
+    from sqlalchemy import create_engine, text
+    
+    settings = get_settings()
+    
+    # Generate query embedding
+    embedding_model = get_embedding_model()
+    query_embedding = embedding_model.embed_query(request.query)
+    
+    # Search Qdrant (use low threshold for better recall)
+    results = qdrant_service.search(
+        query_embedding=query_embedding,
+        guild_id=request.guild_id,
+        channel_ids=[request.channel_id] if request.channel_id else None,
+        limit=request.limit,
+        score_threshold=0.1,
+    )
+    
+    # Fetch message details from Postgres
+    engine = create_engine(settings.database_url.replace("+asyncpg", ""))
+    
+    search_results = []
+    for r in results:
+        payload = r.get("payload", {})
+        message_ids = payload.get("message_ids", [])
+        
+        if not message_ids:
+            continue
+        
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT m.content, u.username, u.global_name, c.name as channel_name, m.message_timestamp
+                FROM messages m
+                JOIN users u ON m.author_id = u.id
+                JOIN channels c ON m.channel_id = c.id
+                WHERE m.id = :msg_id
+            """), {"msg_id": message_ids[0]})
+            row = result.fetchone()
+        
+        if row:
+            search_results.append(SearchResult(
+                content=row.content[:500],
+                author=row.global_name or row.username,
+                channel=row.channel_name,
+                timestamp=row.message_timestamp.isoformat(),
+                score=r.get("score", 0),
+            ))
+    
+    return SearchResponse(results=search_results)
+
+
+@app.get("/guilds/{guild_id}/topics")
+async def get_trending_topics(guild_id: int, days: int = 7) -> dict:
+    """Extract trending topics from recent messages."""
+    from datetime import datetime, timedelta
+    from collections import Counter
+    import re
+    from sqlalchemy import create_engine, text
+    
+    settings = get_settings()
+    engine = create_engine(settings.database_url.replace("+asyncpg", ""))
+    
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT content FROM messages
+            WHERE guild_id = :guild_id
+              AND message_timestamp > :cutoff
+              AND is_deleted = FALSE
+              AND LENGTH(content) > 10
+        """), {"guild_id": guild_id, "cutoff": cutoff})
+        rows = result.fetchall()
+    
+    if not rows:
+        return {"topics": [], "message_count": 0}
+    
+    # Keyword extraction
+    all_text = " ".join(row.content for row in rows)
+    words = re.findall(r'\b[a-zA-Z]{4,15}\b', all_text.lower())
+    
+    # Remove common stop words
+    stop_words = {
+        "that", "this", "with", "have", "just", "like", "from", "they",
+        "would", "there", "their", "what", "about", "which", "when",
+        "make", "been", "more", "some", "could", "than", "other",
+        "http", "https", "www", "com", "org",
+    }
+    words = [w for w in words if w not in stop_words]
+    
+    # Count frequencies
+    word_counts = Counter(words)
+    top_topics = word_counts.most_common(10)
+    
+    return {
+        "guild_id": guild_id,
+        "days": days,
+        "message_count": len(rows),
+        "topics": [
+            {"name": word, "count": count, "trend": "stable"}
+            for word, count in top_topics
+        ],
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     
