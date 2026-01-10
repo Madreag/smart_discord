@@ -94,8 +94,37 @@ async def ask(query: AskQuery) -> AskResponse:
     All queries are filtered by guild_id for multi-tenant isolation.
     """
     from apps.api.src.services.conversation_memory import conversation_memory
+    from apps.api.src.services.security_service import (
+        detect_prompt_injection,
+        validate_output,
+        log_security_event,
+    )
     
     try:
+        # Security check - detect prompt injection attempts
+        security_result = detect_prompt_injection(query.query)
+        
+        if not security_result.is_safe:
+            log_security_event(
+                event_type="prompt_injection_blocked",
+                user_id=query.author_id or 0,
+                guild_id=query.guild_id,
+                details={
+                    "risk_score": security_result.risk_score,
+                    "blocked_patterns": security_result.blocked_patterns,
+                    "query_preview": query.query[:100],
+                },
+            )
+            return AskResponse(
+                answer="I cannot process that request. Please rephrase your question.",
+                sources=[],
+                routed_to=RouterIntent.GENERAL_KNOWLEDGE,
+                execution_time_ms=0,
+            )
+        
+        # Use sanitized input
+        safe_query = security_result.sanitized_input
+        
         # Record user message in conversation memory
         if query.channel_id:
             conversation_memory.add_user_message(
@@ -104,36 +133,36 @@ async def ask(query: AskQuery) -> AskResponse:
                 query.author_name or "User"
             )
         
-        # Step 1: Classify intent
-        intent = await classify_intent(query.query)
+        # Step 1: Classify intent (using sanitized query)
+        intent = await classify_intent(safe_query)
         
-        # Step 2: Route to appropriate agent
+        # Step 2: Route to appropriate agent (using sanitized query)
         if intent == RouterIntent.ANALYTICS_DB:
             response = await process_analytics_query(
-                query=query.query,
+                query=safe_query,
                 guild_id=query.guild_id,
             )
         elif intent == RouterIntent.VECTOR_RAG:
             response = await process_rag_query(
-                query=query.query,
+                query=safe_query,
                 guild_id=query.guild_id,
                 channel_ids=query.channel_ids,
                 channel_id=query.channel_id,
             )
         elif intent == RouterIntent.WEB_SEARCH:
             response = await process_web_search_query(
-                query=query.query,
+                query=safe_query,
                 guild_id=query.guild_id,
             )
         elif intent == RouterIntent.GRAPH_RAG:
             from apps.api.src.agents.graphrag import process_graphrag_query
             response = await process_graphrag_query(
-                query=query.query,
+                query=safe_query,
                 guild_id=query.guild_id,
             )
         elif intent == RouterIntent.GENERAL_KNOWLEDGE:
             response = await process_general_knowledge_query(
-                query=query.query,
+                query=safe_query,
                 guild_id=query.guild_id,
             )
         else:

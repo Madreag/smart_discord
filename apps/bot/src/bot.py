@@ -131,7 +131,7 @@ intents.members = True
 
 
 class IntelligenceBot(commands.Bot):
-    """Discord bot for community intelligence."""
+    """Discord bot for community intelligence with rate limit handling."""
     
     def __init__(self):
         super().__init__(
@@ -151,6 +151,40 @@ class IntelligenceBot(commands.Bot):
         """Called when the bot is fully connected."""
         print(f"Logged in as {self.user} (ID: {self.user.id})")
         print(f"Connected to {len(self.guilds)} guilds")
+    
+    async def on_error(self, event_method: str, *args, **kwargs) -> None:
+        """Handle errors including rate limits gracefully."""
+        import sys
+        import traceback
+        
+        exc_type, exc_value, exc_tb = sys.exc_info()
+        
+        if isinstance(exc_value, discord.HTTPException):
+            if exc_value.status == 429:
+                # Rate limited - log and let discord.py handle retry
+                retry_after = getattr(exc_value, 'retry_after', 5)
+                print(f"[RATELIMIT] Rate limited in {event_method}, retry after {retry_after}s")
+                return
+            elif exc_value.status >= 500:
+                # Discord server error - log but don't crash
+                print(f"[ERROR] Discord server error in {event_method}: {exc_value}")
+                return
+        
+        # Log other errors
+        print(f"[ERROR] Exception in {event_method}:")
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+    
+    async def on_command_error(self, ctx, error) -> None:
+        """Handle command errors including rate limits."""
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(
+                f"⏰ Please wait {error.retry_after:.1f}s before using this command again.",
+                delete_after=5,
+            )
+        elif isinstance(error, commands.MissingPermissions):
+            await ctx.send("❌ You don't have permission to use this command.", delete_after=5)
+        else:
+            print(f"[ERROR] Command error: {error}")
 
 
 bot = IntelligenceBot()
@@ -511,6 +545,7 @@ async def toggle_index(
     channel="Channel to summarize (default: current)",
     hours="Hours to look back (default: 24, max: 168)",
 )
+@app_commands.checks.cooldown(1, 60.0, key=lambda i: (i.guild_id, i.user.id))
 async def summary(
     interaction: discord.Interaction,
     channel: Optional[discord.TextChannel] = None,
@@ -581,6 +616,7 @@ async def summary(
     channel="Limit search to specific channel (optional)",
     limit="Max results (default: 5, max: 10)",
 )
+@app_commands.checks.cooldown(1, 10.0, key=lambda i: (i.guild_id, i.user.id))
 async def search(
     interaction: discord.Interaction,
     query: str,
@@ -650,6 +686,7 @@ async def search(
 @app_commands.describe(
     days="Days to analyze (default: 7, max: 30)",
 )
+@app_commands.checks.cooldown(1, 30.0, key=lambda i: (i.guild_id, i.user.id))
 async def topics(
     interaction: discord.Interaction,
     days: int = 7,
@@ -699,6 +736,32 @@ async def topics(
             f"❌ Error fetching topics: {str(e)[:100]}",
             ephemeral=True,
         )
+
+
+# =============================================================================
+# APP COMMAND ERROR HANDLER
+# =============================================================================
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Handle slash command errors including cooldowns."""
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f"⏰ Please wait **{error.retry_after:.0f}s** before using this command again.",
+            ephemeral=True,
+        )
+    elif isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You don't have permission to use this command.",
+            ephemeral=True,
+        )
+    else:
+        print(f"[ERROR] App command error: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"❌ An error occurred: {str(error)[:100]}",
+                ephemeral=True,
+            )
 
 
 # =============================================================================
