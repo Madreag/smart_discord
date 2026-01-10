@@ -178,6 +178,40 @@ class QdrantService:
         
         return result.status == UpdateStatus.COMPLETED
     
+    def upsert_with_metadata(
+        self,
+        point_id: str,
+        vector: list[float],
+        payload: dict,
+    ) -> bool:
+        """
+        Upsert a single point with custom payload (for document chunks).
+        
+        Args:
+            point_id: Unique point ID
+            vector: Embedding vector
+            payload: Custom payload with source_type, etc.
+            
+        Returns:
+            True if successful
+        """
+        self.ensure_collection()
+        client = self.get_client()
+        
+        result = client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[
+                PointStruct(
+                    id=point_id,
+                    vector=vector,
+                    payload=payload,
+                ),
+            ],
+            wait=True,
+        )
+        
+        return result.status == UpdateStatus.COMPLETED
+    
     def search(
         self,
         query_embedding: list[float],

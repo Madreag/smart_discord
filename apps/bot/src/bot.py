@@ -37,6 +37,86 @@ _db_engine = None
 _processed_messages: set[int] = set()
 _MAX_CACHE_SIZE = 1000
 
+# Whitelisted attachment extensions (security)
+ALLOWED_EXTENSIONS = {
+    ".pdf": "pdf",
+    ".txt": "text",
+    ".md": "markdown",
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".gif": "image",
+    ".webp": "image",
+}
+
+# Blocked extensions (executables - security)
+BLOCKED_EXTENSIONS = {".exe", ".bat", ".sh", ".ps1", ".dll", ".so", ".bin"}
+
+
+def _detect_attachment_type(attachment: "discord.Attachment") -> str | None:
+    """
+    Detect source type from attachment.
+    
+    Returns None if file type is not whitelisted.
+    CRITICAL: This is a security check - reject blocked types.
+    """
+    import os
+    
+    ext = os.path.splitext(attachment.filename.lower())[1]
+    
+    # Block dangerous extensions
+    if ext in BLOCKED_EXTENSIONS:
+        print(f"[SECURITY] Blocked attachment: {attachment.filename}")
+        return None
+    
+    # Check whitelist
+    if ext in ALLOWED_EXTENSIONS:
+        return ALLOWED_EXTENSIONS[ext]
+    
+    # Check content_type fallback
+    content_type = (attachment.content_type or "").lower()
+    if "pdf" in content_type:
+        return "pdf"
+    elif "image/" in content_type:
+        return "image"
+    elif "text/plain" in content_type:
+        return "text"
+    elif "markdown" in content_type:
+        return "markdown"
+    
+    return None
+
+
+def _queue_attachment_processing(
+    attachment: "discord.Attachment",
+    guild_id: int,
+    channel_id: int,
+) -> None:
+    """
+    Queue attachment for processing via Celery.
+    
+    CRITICAL: NO file download here - only metadata to Redis.
+    The actual download happens in the API worker.
+    """
+    try:
+        from apps.bot.src.tasks import process_attachment
+        
+        process_attachment.delay({
+            "attachment_id": attachment.id,
+            "message_id": attachment.id,  # Will be set correctly in save_message_to_db
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "url": attachment.url,
+            "proxy_url": attachment.proxy_url,
+            "filename": attachment.filename,
+            "content_type": attachment.content_type,
+            "size_bytes": attachment.size,
+        })
+        print(f"[ATTACHMENT] Queued {attachment.filename} for processing")
+    except Exception as e:
+        print(f"[ERROR] Failed to queue attachment: {e}")
+
+
 def get_db_engine():
     """Get or create database engine."""
     global _db_engine
@@ -118,6 +198,37 @@ def save_message_to_db(message: "discord.Message") -> bool:
                 "mention_count": len(message.mentions),
                 "message_timestamp": message.created_at,
             })
+            
+            # Save attachments (metadata only - NO file download in bot!)
+            for attachment in message.attachments:
+                # Detect source type from content_type/filename
+                source_type = _detect_attachment_type(attachment)
+                
+                # Only save whitelisted types
+                if source_type:
+                    conn.execute(text("""
+                        INSERT INTO attachments (id, message_id, guild_id, channel_id, url, proxy_url,
+                                                 filename, content_type, size_bytes, source_type,
+                                                 processing_status, created_at, updated_at)
+                        VALUES (:id, :message_id, :guild_id, :channel_id, :url, :proxy_url,
+                                :filename, :content_type, :size_bytes, :source_type,
+                                'pending', NOW(), NOW())
+                        ON CONFLICT (id) DO NOTHING
+                    """), {
+                        "id": attachment.id,
+                        "message_id": message.id,
+                        "guild_id": message.guild.id,
+                        "channel_id": message.channel.id,
+                        "url": attachment.url,
+                        "proxy_url": attachment.proxy_url,
+                        "filename": attachment.filename,
+                        "content_type": attachment.content_type,
+                        "size_bytes": attachment.size,
+                        "source_type": source_type,
+                    })
+                    
+                    # Queue for processing via Celery (NO blocking I/O here!)
+                    _queue_attachment_processing(attachment, message.guild.id, message.channel.id)
             
             conn.commit()
             return True
@@ -375,7 +486,7 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
-            # Step 1: Soft delete in Postgres and get qdrant info
+            # Step 1: Soft delete message in Postgres and get qdrant info
             result = conn.execute(text("""
                 UPDATE messages 
                 SET 
@@ -391,9 +502,22 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
             })
             
             row = result.fetchone()
+            
+            # Step 2: Get and delete attachments (Right to be Forgotten)
+            attach_result = conn.execute(text("""
+                UPDATE attachments
+                SET is_deleted = TRUE, deleted_at = NOW(), updated_at = NOW()
+                WHERE message_id = :message_id AND guild_id = :guild_id
+                RETURNING id, qdrant_point_ids
+            """), {
+                "message_id": message_id,
+                "guild_id": guild_id,
+            })
+            attachment_rows = attach_result.fetchall()
+            
             conn.commit()
             
-            # Step 2: Queue Qdrant deletion if message was indexed
+            # Step 3: Queue Qdrant deletion for message if indexed
             if row and row.qdrant_point_id:
                 delete_message_vector.delay({
                     "guild_id": guild_id,
@@ -403,6 +527,17 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
                 print(f"[DELETE] Queued Qdrant deletion for message {message_id}")
             else:
                 print(f"[DELETE] Message {message_id} soft-deleted (not indexed)")
+            
+            # Step 4: Queue Qdrant deletion for attachments
+            for attach_row in attachment_rows:
+                if attach_row.qdrant_point_ids:
+                    from apps.bot.src.tasks import delete_attachment_vectors
+                    delete_attachment_vectors.delay({
+                        "attachment_id": attach_row.id,
+                        "guild_id": guild_id,
+                        "qdrant_point_ids": [str(pid) for pid in attach_row.qdrant_point_ids],
+                    })
+                    print(f"[DELETE] Queued Qdrant deletion for attachment {attach_row.id}")
                 
     except Exception as e:
         print(f"[ERROR] on_raw_message_delete: {e}")

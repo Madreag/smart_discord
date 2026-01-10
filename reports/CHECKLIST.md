@@ -4,7 +4,7 @@
 
 - [X]**RBAC Permission Check** (REPORT1) — Filter dashboard by admin permissions
 - [X]**Qdrant Indexing Pipeline** (REPORT2) — Embedding + upsert services
-- [ ]**Message Edit/Delete Handlers** (REPORT3) — Sync edits/deletes to Qdrant
+- [X]**Message Edit/Delete Handlers** (REPORT3) — Sync edits/deletes to Qdrant
 
 ## P1 - High
 
@@ -20,15 +20,15 @@
 
 ## P3 - Lower
 
-- [ ]**Slash Commands** (REPORT12) —`/ai summary`,`/ai search`,`/ai topics`
-- [ ]**Rate Limiting** (REPORT9) — Pre-emptive Discord rate limit handling
-- [ ]**CI/CD Pipeline** (REPORT10) — GitHub Actions, linting, security scans
+- [X]**Slash Commands** (REPORT12) —`/ai summary`,`/ai search`,`/ai topics`
+- [X]**Rate Limiting** (REPORT9) — Pre-emptive Discord rate limit handling
+- [X]**CI/CD Pipeline** (REPORT10) — GitHub Actions, linting, security scans
 
 ## Infrastructure
 
-- [ ]**Hybrid Storage Sync** (REPORT7) — Postgres ↔ Qdrant consistency
-- [ ]**Celery Tasks** (REPORT8) — Complete TODO implementations, add retries
-- [ ]**Prompt Injection Protection** (REPORT10) — Input sanitization, output validation
+- [X]**Hybrid Storage Sync** (REPORT7) — Postgres ↔ Qdrant consistency
+- [X]**Celery Tasks** (REPORT8) — Complete TODO implementations, add retries
+- [X]**Prompt Injection Protection** (REPORT10) — Input sanitization, output validation
 
 ---
 

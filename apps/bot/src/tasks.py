@@ -468,3 +468,284 @@ def process_dead_letter(limit: int = 10) -> dict:
         "processed_count": len(processed),
         "items": processed,
     }
+
+
+@celery_app.task(
+    bind=True,
+    name="process_attachment",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    max_retries=3,
+    time_limit=300,  # 5 min max for large files
+)
+def process_attachment(self, payload_dict: dict) -> dict:
+    """
+    Process a Discord attachment (PDF, Image, TXT, MD).
+    
+    CRITICAL: File download happens HERE in the API worker, NOT in the bot.
+    This prevents blocking the Discord Gateway.
+    
+    Pipeline:
+    1. Download file from Discord CDN
+    2. Extract text (PDF/TXT) or generate description (Image)
+    3. Chunk content
+    4. Embed and store in Qdrant with source_type tagging
+    5. Update Postgres with processing status
+    """
+    import asyncio
+    from sqlalchemy import text
+    
+    attachment_id = payload_dict.get("attachment_id")
+    guild_id = payload_dict.get("guild_id")
+    channel_id = payload_dict.get("channel_id")
+    url = payload_dict.get("url")
+    filename = payload_dict.get("filename")
+    
+    print(f"[TASK] process_attachment: {filename}")
+    
+    engine = get_db_engine()
+    
+    try:
+        # Update status to processing
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE attachments 
+                SET processing_status = 'processing', updated_at = NOW()
+                WHERE id = :id
+            """), {"id": attachment_id})
+            conn.commit()
+        
+        # Import document processor
+        from apps.api.src.services.document_processor import (
+            DocumentProcessor,
+            AttachmentPayload,
+        )
+        
+        processor = DocumentProcessor()
+        
+        # Create payload
+        payload = AttachmentPayload(
+            attachment_id=attachment_id,
+            message_id=payload_dict.get("message_id", attachment_id),
+            guild_id=guild_id,
+            channel_id=channel_id,
+            url=url,
+            proxy_url=payload_dict.get("proxy_url"),
+            filename=filename,
+            content_type=payload_dict.get("content_type"),
+            size_bytes=payload_dict.get("size_bytes", 0),
+        )
+        
+        # Process the attachment (async call in sync context)
+        result = asyncio.get_event_loop().run_until_complete(
+            processor.process_attachment(payload)
+        )
+        
+        if not result.success:
+            # Update status to failed
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    UPDATE attachments 
+                    SET processing_status = 'failed', 
+                        processing_error = :error,
+                        updated_at = NOW()
+                    WHERE id = :id
+                """), {"id": attachment_id, "error": result.error})
+                conn.commit()
+            
+            return {
+                "status": "failed",
+                "attachment_id": attachment_id,
+                "error": result.error,
+            }
+        
+        # Store extracted content and chunks
+        chunk_ids = []
+        
+        with engine.connect() as conn:
+            # Update attachment with extracted content
+            conn.execute(text("""
+                UPDATE attachments 
+                SET processing_status = 'completed',
+                    extracted_text = :text,
+                    description = :description,
+                    processed_at = NOW(),
+                    chunk_count = :chunk_count,
+                    updated_at = NOW()
+                WHERE id = :id
+            """), {
+                "id": attachment_id,
+                "text": result.extracted_text,
+                "description": result.description,
+                "chunk_count": len(result.chunks),
+            })
+            
+            # Insert document chunks
+            for chunk in result.chunks:
+                chunk_id = str(uuid4())
+                conn.execute(text("""
+                    INSERT INTO document_chunks (id, attachment_id, guild_id, chunk_index,
+                                                  chunk_text, chunk_type, heading_context, created_at)
+                    VALUES (:id, :attachment_id, :guild_id, :chunk_index,
+                            :chunk_text, :chunk_type, :heading_context, NOW())
+                """), {
+                    "id": chunk_id,
+                    "attachment_id": attachment_id,
+                    "guild_id": guild_id,
+                    "chunk_index": chunk.chunk_index,
+                    "chunk_text": chunk.text,
+                    "chunk_type": chunk.chunk_type,
+                    "heading_context": chunk.heading_context,
+                })
+                chunk_ids.append(chunk_id)
+            
+            conn.commit()
+        
+        # Embed chunks to Qdrant
+        if result.chunks:
+            _embed_document_chunks(
+                attachment_id=attachment_id,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                filename=filename,
+                source_type=result.source_type.value,
+                chunks=result.chunks,
+                chunk_ids=chunk_ids,
+            )
+        
+        return {
+            "status": "success",
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "source_type": result.source_type.value,
+            "chunks_created": len(result.chunks),
+        }
+        
+    except Exception as e:
+        # Update status to failed
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE attachments 
+                SET processing_status = 'failed', 
+                    processing_error = :error,
+                    updated_at = NOW()
+                WHERE id = :id
+            """), {"id": attachment_id, "error": str(e)})
+            conn.commit()
+        
+        raise  # Re-raise for Celery retry
+
+
+@celery_app.task(
+    bind=True,
+    name="delete_attachment_vectors",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    max_retries=3,
+)
+def delete_attachment_vectors(self, payload_dict: dict) -> dict:
+    """
+    Delete attachment vectors from Qdrant (Right to be Forgotten).
+    
+    Called when a message with attachments is deleted.
+    Must hard-delete all document chunks from Qdrant.
+    """
+    from apps.api.src.services.qdrant_service import qdrant_service
+    
+    attachment_id = payload_dict.get("attachment_id")
+    guild_id = payload_dict.get("guild_id")
+    qdrant_point_ids = payload_dict.get("qdrant_point_ids", [])
+    
+    print(f"[TASK] delete_attachment_vectors: attachment {attachment_id}, {len(qdrant_point_ids)} points")
+    
+    deleted_count = 0
+    for point_id in qdrant_point_ids:
+        try:
+            success = qdrant_service.delete_by_session_id(point_id)
+            if success:
+                deleted_count += 1
+        except Exception as e:
+            print(f"[ERROR] Failed to delete point {point_id}: {e}")
+    
+    return {
+        "status": "success",
+        "attachment_id": attachment_id,
+        "deleted_count": deleted_count,
+        "total_points": len(qdrant_point_ids),
+    }
+
+
+def _embed_document_chunks(
+    attachment_id: int,
+    guild_id: int,
+    channel_id: int,
+    filename: str,
+    source_type: str,
+    chunks: list,
+    chunk_ids: list[str],
+) -> None:
+    """
+    Embed document chunks to Qdrant with source_type tagging.
+    
+    Tags chunks with metadata for filtering (e.g., "Search only PDFs").
+    """
+    from sqlalchemy import text
+    from apps.api.src.services.qdrant_service import qdrant_service
+    
+    engine = get_db_engine()
+    qdrant_point_ids = []
+    
+    for chunk, chunk_id in zip(chunks, chunk_ids):
+        try:
+            # Create embedding
+            from apps.api.src.core.config import get_settings
+            from langchain_openai import OpenAIEmbeddings
+            
+            settings = get_settings()
+            embeddings = OpenAIEmbeddings(api_key=settings.openai_api_key)
+            
+            vector = embeddings.embed_query(chunk.text)
+            
+            # Upsert to Qdrant with document metadata
+            point_id = chunk_id
+            qdrant_service.upsert_with_metadata(
+                point_id=point_id,
+                vector=vector,
+                payload={
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "source_type": source_type,  # 'document', 'pdf', 'image', etc.
+                    "type": "document",  # Distinguishes from 'chat' sessions
+                    "parent_file": filename,
+                    "attachment_id": attachment_id,
+                    "chunk_index": chunk.chunk_index,
+                    "chunk_type": chunk.chunk_type,
+                    "heading_context": chunk.heading_context,
+                    "text": chunk.text[:1000],  # Store preview
+                },
+            )
+            
+            qdrant_point_ids.append(point_id)
+            
+            # Update chunk with qdrant_point_id
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    UPDATE document_chunks 
+                    SET qdrant_point_id = :point_id, indexed_at = NOW()
+                    WHERE id = :id
+                """), {"id": chunk_id, "point_id": point_id})
+                conn.commit()
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to embed chunk {chunk_id}: {e}")
+    
+    # Update attachment with qdrant_point_ids
+    if qdrant_point_ids:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE attachments 
+                SET qdrant_point_ids = :point_ids, indexed_at = NOW()
+                WHERE id = :id
+            """), {"id": attachment_id, "point_ids": qdrant_point_ids})
+            conn.commit()
