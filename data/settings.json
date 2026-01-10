@@ -1,0 +1,13 @@
+{
+  "embedding_provider": "local",
+  "embedding_model": "all-MiniLM-L6-v2",
+  "llm_provider": "xai",
+  "xai_model": "grok-4-0709",
+  "thinking_enabled": "true",
+  "thinking_effort": "high",
+  "thinking_budget_tokens": "5000",
+  "vision_model": "grok-4.1-vision",
+  "voyage_api_key": "a-gH9uajpN--1w3OJIH1JJfcjPpjwdHANYAlsB3dtEoFC",
+  "anthropic_model": "claude-3-5-sonnet-20241022",
+  "openai_model": "gpt-4o-mini"
+}

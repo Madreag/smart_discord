@@ -20,7 +20,7 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from packages.shared.python.models import AskQuery, AskResponse, RouterIntent
-from apps.api.src.agents.router import classify_intent
+from apps.api.src.agents.router import classify_intent, should_use_hybrid
 from apps.api.src.agents.analytics import process_analytics_query
 from apps.api.src.agents.vector_rag import process_rag_query
 from apps.api.src.agents.web_search import process_web_search_query
@@ -133,43 +133,59 @@ async def ask(query: AskQuery) -> AskResponse:
                 query.author_name or "User"
             )
         
-        # Step 1: Classify intent (using sanitized query)
-        intent = await classify_intent(safe_query)
+        # Step 1: Check if query needs multi-source (hybrid) routing
+        hybrid_config = should_use_hybrid(safe_query)
         
-        # Step 2: Route to appropriate agent (using sanitized query)
-        if intent == RouterIntent.ANALYTICS_DB:
-            response = await process_analytics_query(
-                query=safe_query,
-                guild_id=query.guild_id,
-            )
-        elif intent == RouterIntent.VECTOR_RAG:
-            response = await process_rag_query(
+        if hybrid_config["use_hybrid"]:
+            print(f"[ROUTER] Using hybrid routing: vector={hybrid_config['include_vector']}, web={hybrid_config['include_web']}")
+            from apps.api.src.agents.hybrid_query import process_hybrid_query
+            response = await process_hybrid_query(
                 query=safe_query,
                 guild_id=query.guild_id,
                 channel_ids=query.channel_ids,
                 channel_id=query.channel_id,
-            )
-        elif intent == RouterIntent.WEB_SEARCH:
-            response = await process_web_search_query(
-                query=safe_query,
-                guild_id=query.guild_id,
-            )
-        elif intent == RouterIntent.GRAPH_RAG:
-            from apps.api.src.agents.graphrag import process_graphrag_query
-            response = await process_graphrag_query(
-                query=safe_query,
-                guild_id=query.guild_id,
-            )
-        elif intent == RouterIntent.GENERAL_KNOWLEDGE:
-            response = await process_general_knowledge_query(
-                query=safe_query,
-                guild_id=query.guild_id,
+                include_vector=hybrid_config["include_vector"],
+                include_web=hybrid_config["include_web"],
+                include_knowledge=hybrid_config["include_knowledge"],
             )
         else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Unknown intent: {intent}",
-            )
+            # Step 2: Classify intent (using sanitized query)
+            intent = await classify_intent(safe_query)
+            
+            # Step 3: Route to appropriate agent (using sanitized query)
+            if intent == RouterIntent.ANALYTICS_DB:
+                response = await process_analytics_query(
+                    query=safe_query,
+                    guild_id=query.guild_id,
+                )
+            elif intent == RouterIntent.VECTOR_RAG:
+                response = await process_rag_query(
+                    query=safe_query,
+                    guild_id=query.guild_id,
+                    channel_ids=query.channel_ids,
+                    channel_id=query.channel_id,
+                )
+            elif intent == RouterIntent.WEB_SEARCH:
+                response = await process_web_search_query(
+                    query=safe_query,
+                    guild_id=query.guild_id,
+                )
+            elif intent == RouterIntent.GRAPH_RAG:
+                from apps.api.src.agents.graphrag import process_graphrag_query
+                response = await process_graphrag_query(
+                    query=safe_query,
+                    guild_id=query.guild_id,
+                )
+            elif intent == RouterIntent.GENERAL_KNOWLEDGE:
+                response = await process_general_knowledge_query(
+                    query=safe_query,
+                    guild_id=query.guild_id,
+                )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unknown intent: {intent}",
+                )
         
         # Record bot response in conversation memory
         if query.channel_id and response.answer:
@@ -343,17 +359,34 @@ class ProviderInfoResponse(BaseModel):
     """Current LLM provider configuration."""
     llm_provider: str
     llm_model: str
+    vision_provider: str
+    vision_model: str
     embedding_provider: str
     embedding_model: str
     has_api_key: bool
+    has_vision_api_key: bool
+    has_voyage_api_key: bool
+    thinking_enabled: bool
+    thinking_effort: str
+    thinking_budget_tokens: int
     available_providers: list[str]
     available_models: dict[str, list[str]]
+    available_vision_models: dict[str, list[str]]
+    available_embedding_providers: list[str]
+    available_embedding_models: dict[str, list[str]]
 
 
 class UpdateProviderRequest(BaseModel):
     """Request to update LLM provider settings."""
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    vision_provider: Optional[str] = None
+    vision_model: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
+    thinking_enabled: Optional[bool] = None
+    thinking_effort: Optional[str] = None
+    thinking_budget_tokens: Optional[int] = None
 
 
 # Available models per provider (updated January 2026)
@@ -371,21 +404,41 @@ AVAILABLE_MODELS = {
         "gpt-4-turbo",
     ],
     "anthropic": [
-        "claude-opus-4-5-20250929",
-        "claude-sonnet-4-5-20250929",
-        "claude-haiku-4-5-20250929",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-3-5-sonnet-20241022",
         "claude-3-5-haiku-20241022",
-        "claude-3-opus-20240229",
+        "claude-3-haiku-20240307",
     ],
     "xai": [
-        "grok-4",
+        "grok-4-1-fast-reasoning",
+        "grok-4-1-fast-non-reasoning",
+        "grok-4-fast-reasoning",
+        "grok-4-fast-non-reasoning",
+        "grok-4-0709",
         "grok-3",
         "grok-3-mini",
-        "grok-2-latest",
-        "grok-beta",
+        "grok-code-fast-1",
+    ],
+}
+
+# Available embedding models per provider
+AVAILABLE_EMBEDDING_MODELS = {
+    "local": [
+        "all-MiniLM-L6-v2",
+        "all-mpnet-base-v2",
+        "multi-qa-mpnet-base-dot-v1",
+        "paraphrase-multilingual-MiniLM-L12-v2",
+    ],
+    "openai": [
+        "text-embedding-3-small",
+        "text-embedding-3-large",
+    ],
+    "voyage": [
+        "voyage-3-large",
+        "voyage-3.5",
+        "voyage-3.5-lite",
+        "voyage-code-3",
+        "voyage-multilingual-2",
+        "voyage-finance-2",
+        "voyage-law-2",
     ],
 }
 
@@ -397,15 +450,38 @@ async def get_provider_settings() -> ProviderInfoResponse:
     
     Returns the active provider configuration and available options.
     """
+    from apps.api.src.core.llm_factory import AVAILABLE_VISION_MODELS, DEFAULT_VISION_MODELS
+    
+    settings = get_settings()
     info = get_provider_info()
+    
+    # Check if vision provider has API key
+    vision_provider = settings.active_vision_provider
+    vision_api_key = settings.get_api_key_for_provider(vision_provider.value)
+    
+    # Get active vision model (or default for provider)
+    vision_model = settings.active_vision_model
+    if not vision_model:
+        vision_model = DEFAULT_VISION_MODELS.get(vision_provider, "")
+    
     return ProviderInfoResponse(
         llm_provider=info["llm_provider"],
         llm_model=info["llm_model"],
+        vision_provider=vision_provider.value,
+        vision_model=vision_model,
         embedding_provider=info["embedding_provider"],
         embedding_model=info["embedding_model"],
         has_api_key=info["has_api_key"],
+        has_vision_api_key=vision_api_key is not None,
+        has_voyage_api_key=settings.get_api_key_for_provider("voyage") is not None,
+        thinking_enabled=settings.active_thinking_enabled,
+        thinking_effort=settings.active_thinking_effort,
+        thinking_budget_tokens=settings.active_thinking_budget_tokens,
         available_providers=["openai", "anthropic", "xai"],
         available_models=AVAILABLE_MODELS,
+        available_vision_models=AVAILABLE_VISION_MODELS,
+        available_embedding_providers=["local", "openai", "voyage"],
+        available_embedding_models=AVAILABLE_EMBEDDING_MODELS,
     )
 
 
@@ -417,18 +493,18 @@ async def update_provider_settings(request: UpdateProviderRequest) -> ProviderIn
     Changes take effect immediately without server restart.
     """
     from apps.api.src.core.config import set_runtime_override, LLMProvider
+    from apps.api.src.core.llm_factory import AVAILABLE_VISION_MODELS, DEFAULT_VISION_MODELS
     
     settings = get_settings()
     
-    # Validate and set provider
+    # Validate and set LLM provider
     if request.llm_provider:
         if request.llm_provider not in ["openai", "anthropic", "xai"]:
             raise HTTPException(status_code=400, detail=f"Invalid provider: {request.llm_provider}")
         set_runtime_override("llm_provider", request.llm_provider)
     
-    # Validate and set model
+    # Validate and set LLM model
     if request.llm_model:
-        # Get the current/new provider
         provider = request.llm_provider or settings.active_llm_provider.value
         if request.llm_model not in AVAILABLE_MODELS.get(provider, []):
             raise HTTPException(
@@ -437,16 +513,99 @@ async def update_provider_settings(request: UpdateProviderRequest) -> ProviderIn
             )
         set_runtime_override(f"{provider}_model", request.llm_model)
     
+    # Validate and set vision provider
+    if request.vision_provider:
+        if request.vision_provider not in ["openai", "anthropic", "xai"]:
+            raise HTTPException(status_code=400, detail=f"Invalid vision provider: {request.vision_provider}")
+        set_runtime_override("vision_provider", request.vision_provider)
+        # Reset vision model to default when provider changes
+        if not request.vision_model:
+            default_model = DEFAULT_VISION_MODELS.get(LLMProvider(request.vision_provider), "")
+            set_runtime_override("vision_model", default_model)
+    
+    # Validate and set vision model
+    if request.vision_model:
+        vision_prov = request.vision_provider or settings.active_vision_provider.value
+        if request.vision_model not in AVAILABLE_VISION_MODELS.get(vision_prov, []):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid vision model '{request.vision_model}' for provider '{vision_prov}'"
+            )
+        set_runtime_override("vision_model", request.vision_model)
+    
+    # Validate and set thinking settings
+    if request.thinking_enabled is not None:
+        set_runtime_override("thinking_enabled", str(request.thinking_enabled).lower())
+    
+    if request.thinking_effort:
+        if request.thinking_effort not in ["low", "medium", "high"]:
+            raise HTTPException(status_code=400, detail=f"Invalid thinking effort: {request.thinking_effort}")
+        set_runtime_override("thinking_effort", request.thinking_effort)
+    
+    if request.thinking_budget_tokens is not None:
+        if request.thinking_budget_tokens < 100 or request.thinking_budget_tokens > 50000:
+            raise HTTPException(status_code=400, detail="thinking_budget_tokens must be between 100 and 50000")
+        set_runtime_override("thinking_budget_tokens", str(request.thinking_budget_tokens))
+    
+    # Validate and set embedding provider
+    embedding_changed = False
+    if request.embedding_provider:
+        if request.embedding_provider not in ["local", "openai", "voyage"]:
+            raise HTTPException(status_code=400, detail=f"Invalid embedding provider: {request.embedding_provider}")
+        if request.embedding_provider != settings.embedding_provider.value:
+            embedding_changed = True
+        set_runtime_override("embedding_provider", request.embedding_provider)
+        # Set default model for new provider if model not specified
+        if not request.embedding_model:
+            default_model = AVAILABLE_EMBEDDING_MODELS.get(request.embedding_provider, [""])[0]
+            set_runtime_override("embedding_model", default_model)
+    
+    # Validate and set embedding model
+    if request.embedding_model:
+        embed_prov = request.embedding_provider or settings.embedding_provider.value
+        if request.embedding_model not in AVAILABLE_EMBEDDING_MODELS.get(embed_prov, []):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid embedding model '{request.embedding_model}' for provider '{embed_prov}'"
+            )
+        if request.embedding_model != settings.embedding_model:
+            embedding_changed = True
+        set_runtime_override("embedding_model", request.embedding_model)
+    
     # Return updated settings
     info = get_provider_info()
+    vision_provider = request.vision_provider or settings.active_vision_provider.value
+    vision_api_key = settings.get_api_key_for_provider(vision_provider)
+    
+    # Get active vision model
+    vision_model = settings.active_vision_model
+    if request.vision_model:
+        vision_model = request.vision_model
+    elif not vision_model:
+        vision_model = DEFAULT_VISION_MODELS.get(LLMProvider(vision_provider), "")
+    
+    # Get embedding info (use active values which check runtime overrides)
+    embedding_provider = request.embedding_provider or settings.active_embedding_provider.value
+    embedding_model = request.embedding_model or settings.active_embedding_model
+    
     return ProviderInfoResponse(
         llm_provider=info["llm_provider"],
         llm_model=info["llm_model"],
-        embedding_provider=info["embedding_provider"],
-        embedding_model=info["embedding_model"],
+        vision_provider=vision_provider,
+        vision_model=vision_model,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
         has_api_key=info["has_api_key"],
+        has_vision_api_key=vision_api_key is not None,
+        has_voyage_api_key=settings.get_api_key_for_provider("voyage") is not None,
+        thinking_enabled=settings.active_thinking_enabled if request.thinking_enabled is None else request.thinking_enabled,
+        thinking_effort=settings.active_thinking_effort if request.thinking_effort is None else request.thinking_effort,
+        thinking_budget_tokens=settings.active_thinking_budget_tokens if request.thinking_budget_tokens is None else request.thinking_budget_tokens,
         available_providers=["openai", "anthropic", "xai"],
         available_models=AVAILABLE_MODELS,
+        available_vision_models=AVAILABLE_VISION_MODELS,
+        available_embedding_providers=["local", "openai", "voyage"],
+        available_embedding_models=AVAILABLE_EMBEDDING_MODELS,
     )
 
 
@@ -712,6 +871,12 @@ async def get_api_keys() -> ApiKeysResponse:
             is_set=bool(settings.get_api_key_for_provider("tavily")),
             masked_value=mask_api_key(settings.get_api_key_for_provider("tavily")),
         ),
+        ApiKeyInfo(
+            provider="voyage",
+            label="Voyage AI (Embeddings)",
+            is_set=bool(settings.get_api_key_for_provider("voyage")),
+            masked_value=mask_api_key(settings.get_api_key_for_provider("voyage")),
+        ),
     ]
     
     return ApiKeysResponse(keys=keys)
@@ -724,7 +889,7 @@ async def update_api_key(request: UpdateApiKeyRequest) -> ApiKeysResponse:
     """
     from apps.api.src.core.config import set_runtime_override
     
-    valid_providers = ["openai", "anthropic", "xai", "tavily"]
+    valid_providers = ["openai", "anthropic", "xai", "tavily", "voyage"]
     if request.provider not in valid_providers:
         raise HTTPException(status_code=400, detail=f"Invalid provider: {request.provider}")
     
@@ -1217,6 +1382,26 @@ async def repair_sync(guild_id: int, force: bool = False) -> dict:
         "force": force,
         "status": "repair_queued",
         "message": f"Reset {count} messages for re-indexing. Run indexing script to complete.",
+    }
+
+
+@app.post("/guilds/{guild_id}/channels/{channel_id}/reindex")
+async def reindex_channel(guild_id: int, channel_id: int) -> dict:
+    """
+    Trigger re-indexing for a specific channel.
+    
+    Resets sync status for all messages in the channel so they get re-indexed.
+    """
+    from apps.api.src.services.storage_service import storage_service
+    
+    count = storage_service.reset_channel_sync_status(guild_id, channel_id)
+    
+    return {
+        "guild_id": guild_id,
+        "channel_id": channel_id,
+        "messages_reset": count,
+        "status": "reindex_queued",
+        "message": f"Reset {count} messages for re-indexing.",
     }
 
 

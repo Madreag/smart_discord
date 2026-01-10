@@ -5,7 +5,7 @@ These mirror the TypeScript interfaces in src/types.ts.
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -101,6 +101,7 @@ class RouterIntent(str, Enum):
     GRAPH_RAG = "graph_rag"  # Thematic/broad queries
     WEB_SEARCH = "web_search"
     GENERAL_KNOWLEDGE = "general_knowledge"
+    HYBRID = "hybrid"  # Multi-source: vector + web + knowledge
 
 
 class AskQuery(BaseModel):
@@ -116,17 +117,19 @@ class MessageSource(BaseModel):
     """Source reference in RAG responses."""
     message_id: int
     channel_id: int
-    author_id: int
+    author_id: int = 0  # 0 for document sources
     content: str
-    timestamp: datetime
+    timestamp: Optional[datetime] = None  # Optional for document chunks
     relevance_score: float
+    source_type: Optional[str] = None  # 'chat', 'pdf', 'markdown', etc.
+    parent_file: Optional[str] = None  # Filename for document sources
 
 
 class AskResponse(BaseModel):
     """Response payload from /ask endpoint."""
     answer: str
     sources: list[MessageSource]
-    routed_to: RouterIntent
+    routed_to: Union[RouterIntent, str]  # Can be enum or dynamic label like "vector + knowledge"
     execution_time_ms: float
 
 

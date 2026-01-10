@@ -42,6 +42,15 @@ ANALYTICS_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 VECTOR_RAG_PATTERNS: list[re.Pattern[str]] = [
+    # Document/file queries (multimodal)
+    re.compile(r"\b(summarize|summary of|read|what('s| is) in)\b.*\b(file|document|pdf|report|attachment)\b", re.IGNORECASE),
+    re.compile(r"\b(file|document|pdf|report|attachment)\b.*\b(summarize|summary|about|contains?)\b", re.IGNORECASE),
+    re.compile(r"\b(summarize|explain|describe)\b.*\b(this|the|attached)\b", re.IGNORECASE),
+    re.compile(r"\b(what does|can you read)\b.*\b(say|contain)\b", re.IGNORECASE),
+    # Image/picture queries
+    re.compile(r"\b(what('s| is|does)|describe|explain|show)\b.*\b(this|the)?\s*(picture|image|photo|screenshot|diagram|chart)\b", re.IGNORECASE),
+    re.compile(r"\b(picture|image|photo|screenshot)\b.*\b(show|about|of|contain)\b", re.IGNORECASE),
+    re.compile(r"\[Attachments?:.*\.(png|jpg|jpeg|gif|webp)\]", re.IGNORECASE),
     # Content/topic queries
     re.compile(r"\b(what (was|were|is|are)|summarize|summary of)\b.*\b(said|discussed|talked|mentioned)\b", re.IGNORECASE),
     re.compile(r"\b(summarize|summary of)\b.*\b(discussion|conversation|chat|thread)\b", re.IGNORECASE),
@@ -199,6 +208,73 @@ Respond with ONLY the category name, nothing else."""
     except Exception:
         # Any other error - default to general knowledge
         return RouterIntent.GENERAL_KNOWLEDGE
+
+
+def should_use_hybrid(query: str) -> dict:
+    """
+    Determine if a query should use multi-source (hybrid) routing.
+    
+    Returns a dict with:
+        - use_hybrid: bool - whether to use hybrid routing
+        - include_vector: bool - whether to search Discord context
+        - include_web: bool - whether to search the web
+        - include_knowledge: bool - whether to use LLM knowledge
+    """
+    query_lower = query.lower()
+    
+    # Patterns that suggest needing Discord context
+    discord_context_patterns = [
+        r'\b(file|document|pdf|attachment|uploaded|shared)\b',
+        r'\b(said|mentioned|discussed|talked about)\b',
+        r'\b(in (this|the) (server|channel|chat))\b',
+        r'\[Attachments?:',
+    ]
+    
+    # Patterns that suggest needing web search
+    web_search_patterns = [
+        r'\b(latest|current|recent|now|today)\b',
+        r'\b(how (do|does|to|can I))\b',
+        r'\b(what is|who is|where is)\b',
+        r'\b(explain|define|meaning of)\b',
+    ]
+    
+    # Patterns for meta questions about the bot's capabilities
+    meta_patterns = [
+        r'\b(can you|are you able|do you)\b.*\b(see|read|access|view)\b',
+        r'\b(what (can|do) you)\b',
+        r'\b(your capabilities|how do you work)\b',
+    ]
+    
+    include_vector = any(re.search(p, query, re.IGNORECASE) for p in discord_context_patterns)
+    include_web = any(re.search(p, query, re.IGNORECASE) for p in web_search_patterns)
+    is_meta = any(re.search(p, query, re.IGNORECASE) for p in meta_patterns)
+    
+    # Meta questions about the bot should check vector first (for context about files)
+    # then fall back to knowledge
+    if is_meta and include_vector:
+        return {
+            "use_hybrid": True,
+            "include_vector": True,
+            "include_web": False,
+            "include_knowledge": True,
+        }
+    
+    # If query seems to need both Discord context AND external info
+    if include_vector and include_web:
+        return {
+            "use_hybrid": True,
+            "include_vector": True,
+            "include_web": True,
+            "include_knowledge": True,
+        }
+    
+    # Default: single-source routing
+    return {
+        "use_hybrid": False,
+        "include_vector": include_vector,
+        "include_web": include_web,
+        "include_knowledge": True,
+    }
 
 
 async def classify_intent(query: str) -> RouterIntent:

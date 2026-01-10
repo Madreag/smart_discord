@@ -358,6 +358,37 @@ class HybridStorageService:
         except Exception as e:
             print(f"[SYNC] Error resetting sync status: {e}")
             return 0
+    
+    def reset_channel_sync_status(self, guild_id: int, channel_id: int) -> int:
+        """
+        Reset sync status for a specific channel to trigger re-indexing.
+        
+        Args:
+            guild_id: Target guild
+            channel_id: Target channel
+            
+        Returns:
+            Number of messages reset
+        """
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text("""
+                    UPDATE messages
+                    SET qdrant_point_id = NULL, indexed_at = NULL
+                    WHERE guild_id = :guild_id 
+                      AND channel_id = :channel_id 
+                      AND is_deleted = FALSE
+                """), {"guild_id": guild_id, "channel_id": channel_id})
+                
+                count = result.rowcount
+                conn.commit()
+            
+            print(f"[SYNC] Reset sync status for {count} messages in channel {channel_id}")
+            return count
+            
+        except Exception as e:
+            print(f"[SYNC] Error resetting channel sync status: {e}")
+            return 0
 
 
 # Global service instance

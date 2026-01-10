@@ -5,11 +5,21 @@ import { useEffect, useState } from "react";
 interface ProviderSettings {
   llm_provider: string;
   llm_model: string;
+  vision_provider: string;
+  vision_model: string;
   embedding_provider: string;
   embedding_model: string;
   has_api_key: boolean;
+  has_vision_api_key: boolean;
+  has_voyage_api_key: boolean;
+  thinking_enabled: boolean;
+  thinking_effort: string;
+  thinking_budget_tokens: number;
   available_providers: string[];
   available_models: Record<string, string[]>;
+  available_vision_models: Record<string, string[]>;
+  available_embedding_providers: string[];
+  available_embedding_models: Record<string, string[]>;
 }
 
 const providerLabels: Record<string, string> = {
@@ -19,8 +29,9 @@ const providerLabels: Record<string, string> = {
 };
 
 const embeddingLabels: Record<string, string> = {
-  local: "Local (sentence-transformers)",
-  openai: "OpenAI Embeddings",
+  local: "Local (Free)",
+  openai: "OpenAI",
+  voyage: "Voyage AI",
 };
 
 export default function SettingsPage() {
@@ -48,7 +59,7 @@ export default function SettingsPage() {
     fetchSettings();
   }, []);
 
-  const updateSettings = async (updates: { llm_provider?: string; llm_model?: string }) => {
+  const updateSettings = async (updates: { llm_provider?: string; llm_model?: string; vision_provider?: string; vision_model?: string; embedding_provider?: string; embedding_model?: string; thinking_enabled?: boolean; thinking_effort?: string; thinking_budget_tokens?: number }) => {
     setSaving(true);
     setSaveStatus("idle");
     try {
@@ -83,6 +94,39 @@ export default function SettingsPage() {
 
   const handleModelChange = (newModel: string) => {
     updateSettings({ llm_model: newModel });
+  };
+
+  const handleVisionProviderChange = (newProvider: string) => {
+    if (!settings) return;
+    // When changing vision provider, set the first available model for that provider
+    const firstModel = settings.available_vision_models[newProvider]?.[0];
+    updateSettings({ vision_provider: newProvider, vision_model: firstModel });
+  };
+
+  const handleVisionModelChange = (newModel: string) => {
+    updateSettings({ vision_model: newModel });
+  };
+
+  const handleThinkingEnabledChange = (enabled: boolean) => {
+    updateSettings({ thinking_enabled: enabled });
+  };
+
+  const handleThinkingEffortChange = (effort: string) => {
+    updateSettings({ thinking_effort: effort });
+  };
+
+  const handleThinkingBudgetChange = (budget: number) => {
+    updateSettings({ thinking_budget_tokens: budget });
+  };
+
+  const handleEmbeddingProviderChange = (newProvider: string) => {
+    if (!settings) return;
+    const firstModel = settings.available_embedding_models[newProvider]?.[0];
+    updateSettings({ embedding_provider: newProvider, embedding_model: firstModel });
+  };
+
+  const handleEmbeddingModelChange = (newModel: string) => {
+    updateSettings({ embedding_model: newModel });
   };
 
   return (
@@ -214,19 +258,62 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                {/* Embedding Provider */}
+                {/* Vision/File Processing Provider */}
+                <div className="pt-4 border-t border-gray-700">
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    Vision & File Processing Provider
+                  </label>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Used for processing images and documents (PDFs, etc.)
+                  </p>
+                  <div className="relative">
+                    <select
+                      value={settings.vision_provider}
+                      onChange={(e) => handleVisionProviderChange(e.target.value)}
+                      disabled={saving}
+                      className={`w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-pointer hover:border-gray-600 focus:border-discord-blurple focus:outline-none transition-colors ${saving ? "opacity-50 cursor-wait" : ""}`}
+                    >
+                      {settings.available_providers.map((provider) => (
+                        <option key={provider} value={provider}>
+                          {providerLabels[provider] || provider}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="absolute inset-y-0 right-0 flex items-center px-3 pointer-events-none">
+                      <svg className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </div>
+                  </div>
+                  <div className={`mt-2 flex items-center gap-2 text-xs ${
+                    settings.has_vision_api_key ? "text-green-400" : "text-yellow-400"
+                  }`}>
+                    <div className={`h-2 w-2 rounded-full ${
+                      settings.has_vision_api_key ? "bg-green-500" : "bg-yellow-500"
+                    }`}></div>
+                    {settings.has_vision_api_key 
+                      ? "Vision API key configured" 
+                      : "No API key for selected vision provider"}
+                  </div>
+                </div>
+
+                {/* Vision Model Selection */}
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Embedding Provider
+                    Vision Model
                   </label>
                   <div className="relative">
                     <select
-                      value={settings.embedding_provider}
-                      disabled
-                      className="w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-not-allowed opacity-75"
+                      value={settings.vision_model}
+                      onChange={(e) => handleVisionModelChange(e.target.value)}
+                      disabled={saving}
+                      className={`w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-pointer hover:border-gray-600 focus:border-discord-blurple focus:outline-none transition-colors ${saving ? "opacity-50 cursor-wait" : ""}`}
                     >
-                      <option value="local">Local (sentence-transformers)</option>
-                      <option value="openai">OpenAI Embeddings</option>
+                      {settings.available_vision_models[settings.vision_provider]?.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))}
                     </select>
                     <div className="absolute inset-y-0 right-0 flex items-center px-3 pointer-events-none">
                       <svg className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -235,10 +322,146 @@ export default function SettingsPage() {
                     </div>
                   </div>
                   <p className="text-xs text-gray-500 mt-2">
-                    Model: <span className="text-gray-400">{settings.embedding_model}</span>
-                    {settings.embedding_provider === "local" && (
-                      <span className="text-green-500 ml-2">(Free, no API key required)</span>
-                    )}
+                    Model used for image captioning and document analysis
+                  </p>
+                </div>
+
+                {/* Thinking Mode Settings */}
+                <div className="pt-4 border-t border-gray-700">
+                  <div className="flex items-center justify-between mb-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300">
+                        Extended Thinking Mode
+                      </label>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Enable deep reasoning for complex problems (Claude, OpenAI o1/o3, Grok)
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => handleThinkingEnabledChange(!settings.thinking_enabled)}
+                      disabled={saving}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                        settings.thinking_enabled ? "bg-discord-blurple" : "bg-gray-600"
+                      } ${saving ? "opacity-50 cursor-wait" : "cursor-pointer"}`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                          settings.thinking_enabled ? "translate-x-6" : "translate-x-1"
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {settings.thinking_enabled && (
+                    <>
+                      {/* Thinking Effort */}
+                      <div className="mb-4">
+                        <label className="block text-sm font-medium text-gray-300 mb-2">
+                          Thinking Effort
+                        </label>
+                        <div className="relative">
+                          <select
+                            value={settings.thinking_effort}
+                            onChange={(e) => handleThinkingEffortChange(e.target.value)}
+                            disabled={saving}
+                            className={`w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-pointer hover:border-gray-600 focus:border-discord-blurple focus:outline-none transition-colors ${saving ? "opacity-50 cursor-wait" : ""}`}
+                          >
+                            <option value="low">Low - Quick responses</option>
+                            <option value="medium">Medium - Balanced</option>
+                            <option value="high">High - Deep reasoning</option>
+                          </select>
+                          <div className="absolute inset-y-0 right-0 flex items-center px-3 pointer-events-none">
+                            <svg className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                            </svg>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Budget Tokens (for Claude) */}
+                      {settings.llm_provider === "anthropic" && (
+                        <div>
+                          <label className="block text-sm font-medium text-gray-300 mb-2">
+                            Thinking Budget (tokens)
+                          </label>
+                          <input
+                            type="number"
+                            value={settings.thinking_budget_tokens}
+                            onChange={(e) => handleThinkingBudgetChange(parseInt(e.target.value) || 2000)}
+                            min={100}
+                            max={50000}
+                            disabled={saving}
+                            className={`w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white focus:border-discord-blurple focus:outline-none transition-colors ${saving ? "opacity-50 cursor-wait" : ""}`}
+                          />
+                          <p className="text-xs text-gray-500 mt-2">
+                            Claude-specific: How many tokens to allocate for reasoning (100-50,000)
+                          </p>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                {/* Embedding Provider */}
+                <div className="pt-4 border-t border-gray-700">
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    Embedding Provider
+                  </label>
+                  <div className="relative">
+                    <select
+                      value={settings.embedding_provider}
+                      onChange={(e) => handleEmbeddingProviderChange(e.target.value)}
+                      disabled={saving}
+                      className={`w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-pointer hover:border-gray-600 focus:border-discord-blurple focus:outline-none transition-colors ${saving ? "opacity-50 cursor-wait" : ""}`}
+                    >
+                      {settings.available_embedding_providers?.map((provider) => (
+                        <option key={provider} value={provider}>
+                          {embeddingLabels[provider] || provider}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="absolute inset-y-0 right-0 flex items-center px-3 pointer-events-none">
+                      <svg className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </div>
+                  </div>
+                  {settings.embedding_provider === "voyage" && !settings.has_voyage_api_key && (
+                    <p className="text-xs text-yellow-500 mt-2">
+                      ⚠️ Voyage API key not configured. <a href="/dashboard/settings/keys" className="underline">Add it here</a>
+                    </p>
+                  )}
+                  {settings.embedding_provider === "local" && (
+                    <p className="text-xs text-green-500 mt-2">Free, no API key required</p>
+                  )}
+                </div>
+
+                {/* Embedding Model */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    Embedding Model
+                  </label>
+                  <div className="relative">
+                    <select
+                      value={settings.embedding_model}
+                      onChange={(e) => handleEmbeddingModelChange(e.target.value)}
+                      disabled={saving}
+                      className={`w-full bg-discord-dark border border-gray-700 rounded-lg px-4 py-3 text-white appearance-none cursor-pointer hover:border-gray-600 focus:border-discord-blurple focus:outline-none transition-colors ${saving ? "opacity-50 cursor-wait" : ""}`}
+                    >
+                      {settings.available_embedding_models?.[settings.embedding_provider]?.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="absolute inset-y-0 right-0 flex items-center px-3 pointer-events-none">
+                      <svg className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </div>
+                  </div>
+                  <p className="text-xs text-yellow-600 mt-2">
+                    ⚠️ Changing embedding model requires re-indexing your data
                   </p>
                 </div>
               </>
@@ -258,8 +481,11 @@ export default function SettingsPage() {
               Add these to your <code className="bg-discord-dark px-2 py-1 rounded">.env</code> file:
             </p>
             <pre className="bg-discord-dark rounded-lg p-4 text-sm overflow-x-auto">
-              <code className="text-gray-300">{`# Choose provider: openai, anthropic, or xai
+              <code className="text-gray-300">{`# Choose LLM provider: openai, anthropic, or xai
 LLM_PROVIDER=anthropic
+
+# Vision/File processing provider (for images, PDFs)
+VISION_PROVIDER=xai
 
 # OpenAI
 OPENAI_API_KEY=sk-...
@@ -270,8 +496,12 @@ ANTHROPIC_API_KEY=sk-ant-...
 # xAI (Grok)
 XAI_API_KEY=xai-...
 
-# Embeddings (local = free)
-EMBEDDING_PROVIDER=local`}</code>
+# Voyage AI (for embeddings)
+VOYAGE_API_KEY=pa-...
+
+# Embeddings: local, openai, or voyage
+EMBEDDING_PROVIDER=local
+EMBEDDING_MODEL=all-MiniLM-L6-v2`}</code>
             </pre>
           </div>
         </div>

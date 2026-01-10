@@ -53,12 +53,42 @@ async def search_vectors(
     try:
         from apps.api.src.services.qdrant_service import qdrant_service
         from apps.api.src.core.llm_factory import get_embedding_model
+        import re
         
-        # Get embedding for query
+        # Detect if query mentions attachments/files - search documents first
+        attachment_pattern = r'\[Attachments?:\s*([^\]]+)\]'
+        attachment_match = re.search(attachment_pattern, query, re.IGNORECASE)
+        
+        # Also detect file-related keywords
+        file_keywords = r'\b(file|document|pdf|report|attachment|attached|uploaded)\b'
+        mentions_file = re.search(file_keywords, query, re.IGNORECASE)
+        
+        # Get embedding for query (use clean query for better matching)
+        clean_query = re.sub(attachment_pattern, '', query).strip()
         embedding_model = get_embedding_model()
-        query_embedding = embedding_model.embed_query(query)
+        query_embedding = embedding_model.embed_query(clean_query if clean_query else query)
         
-        # Search Qdrant with multi-tenant filter
+        results = []
+        
+        # If attachments mentioned, search documents first with lower threshold
+        if attachment_match or mentions_file:
+            print(f"[VECTOR_RAG] Detected document query, searching document chunks first")
+            doc_results = qdrant_service.search(
+                query_embedding=query_embedding,
+                guild_id=guild_id,
+                channel_ids=channel_ids,
+                limit=limit,
+                score_threshold=0.0,  # Lower threshold for documents
+                source_types=['pdf', 'markdown', 'text', 'image'],
+            )
+            results.extend(doc_results)
+            
+            # If we found documents, return them; otherwise fall back to chat
+            if results:
+                print(f"[VECTOR_RAG] Found {len(results)} document chunks")
+                return results
+        
+        # Standard search (chat messages + documents)
         results = qdrant_service.search(
             query_embedding=query_embedding,
             guild_id=guild_id,
@@ -123,13 +153,23 @@ async def generate_rag_response(
         
         llm = get_llm(temperature=0.3)
         
-        # Format context from vector search
+        # Format context from vector search (supports both chat sessions and document chunks)
         context_text = ""
         if context_chunks:
-            context_text = "\n\n".join([
-                f"[Relevance: {chunk['score']:.2f}]\n{chunk['payload'].get('summary', chunk['payload'].get('content', ''))}"
-                for chunk in context_chunks
-            ])
+            formatted_chunks = []
+            for chunk in context_chunks:
+                payload = chunk['payload']
+                # Document chunks use 'text', chat sessions use 'summary' or 'content'
+                text = payload.get('text', payload.get('summary', payload.get('content', '')))
+                source_type = payload.get('source_type', 'chat')
+                parent_file = payload.get('parent_file', '')
+                
+                if source_type != 'chat' and parent_file:
+                    formatted_chunks.append(f"[Source: {parent_file}, Relevance: {chunk['score']:.2f}]\n{text}")
+                else:
+                    formatted_chunks.append(f"[Relevance: {chunk['score']:.2f}]\n{text}")
+            
+            context_text = "\n\n".join(formatted_chunks)
         
         # Fetch guild pre-prompt for personality injection
         from apps.api.src.core.pre_prompt import get_guild_pre_prompt
@@ -170,12 +210,18 @@ def _fallback_response(context_chunks: list[dict[str, Any]]) -> str:
     if not context_chunks:
         return "No relevant content found."
     
-    summaries = [
-        chunk['payload'].get('summary', chunk['payload'].get('content', ''))[:200]
-        for chunk in context_chunks[:3]
-    ]
+    summaries = []
+    for chunk in context_chunks[:3]:
+        payload = chunk['payload']
+        # Support document chunks (text) and chat sessions (summary/content)
+        text = payload.get('text', payload.get('summary', payload.get('content', '')))[:200]
+        parent_file = payload.get('parent_file', '')
+        if parent_file:
+            summaries.append(f"[{parent_file}] {text}")
+        else:
+            summaries.append(text)
     
-    return f"Found {len(context_chunks)} relevant discussions:\n" + "\n".join(
+    return f"Found {len(context_chunks)} relevant results:\n" + "\n".join(
         f"- {s}..." for s in summaries if s
     )
 
@@ -224,18 +270,38 @@ async def process_rag_query(
     # Generate response from context
     answer = await generate_rag_response(query, results, guild_id, conversation_context)
     
-    # Convert results to MessageSource format
+    # Convert results to MessageSource format (supports both chat and document sources)
     sources = []
     for result in results:
         payload = result.get("payload", {})
+        source_type = payload.get("source_type", "chat")
+        
+        # Get content - document chunks use 'text', chat uses 'content' or 'summary'
+        content = payload.get("text", payload.get("content", payload.get("summary", "")))[:500]
+        
+        # Get timestamp - may be None for document chunks
+        timestamp_str = payload.get("timestamp", payload.get("start_time"))
+        timestamp = None
+        if timestamp_str:
+            try:
+                from datetime import datetime
+                if isinstance(timestamp_str, str):
+                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                else:
+                    timestamp = timestamp_str
+            except (ValueError, TypeError):
+                timestamp = None
+        
         sources.append(
             MessageSource(
-                message_id=payload.get("message_id", 0),
+                message_id=payload.get("message_id", payload.get("attachment_id", 0)),
                 channel_id=payload.get("channel_id", 0),
                 author_id=payload.get("author_id", 0),
-                content=payload.get("content", payload.get("summary", ""))[:500],
-                timestamp=payload.get("timestamp", payload.get("start_time", "")),
+                content=content,
+                timestamp=timestamp,
                 relevance_score=result.get("score", 0.0),
+                source_type=source_type,
+                parent_file=payload.get("parent_file"),
             )
         )
     

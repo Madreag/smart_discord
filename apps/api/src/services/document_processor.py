@@ -258,13 +258,56 @@ class DocumentProcessor:
             )
     
     async def _process_scanned_pdf(self, payload: AttachmentPayload) -> ProcessingResult:
-        """Handle scanned PDFs by routing to Vision LLM."""
-        # For now, return error - Vision OCR can be added later
-        return ProcessingResult(
-            success=False,
-            source_type=SourceType.PDF,
-            error="Scanned PDF detected (no text layer). OCR not yet implemented.",
-        )
+        """Handle scanned PDFs using OCR (pdf2image + pytesseract)."""
+        try:
+            from pdf2image import convert_from_bytes
+            import pytesseract
+            
+            # Download the PDF again for OCR processing
+            file_content = await self.download_file(payload.url)
+            
+            # Convert PDF pages to images
+            images = convert_from_bytes(file_content, dpi=200)
+            
+            # OCR each page
+            full_text = []
+            for i, img in enumerate(images):
+                text = pytesseract.image_to_string(img)
+                if text.strip():
+                    full_text.append(f"--- Page {i + 1} ---\n{text}")
+            
+            extracted = "\n\n".join(full_text)
+            
+            if not extracted.strip():
+                return ProcessingResult(
+                    success=False,
+                    source_type=SourceType.PDF,
+                    error="OCR could not extract any text from scanned PDF",
+                )
+            
+            # Chunk the OCR text
+            chunks = self._recursive_chunk(extracted, payload.filename)
+            
+            return ProcessingResult(
+                success=True,
+                source_type=SourceType.PDF,
+                extracted_text=extracted,
+                description="Scanned PDF processed with OCR",
+                chunks=chunks,
+            )
+            
+        except ImportError as e:
+            return ProcessingResult(
+                success=False,
+                source_type=SourceType.PDF,
+                error=f"OCR dependencies not installed: {e}. Run: pip install pdf2image pytesseract",
+            )
+        except Exception as e:
+            return ProcessingResult(
+                success=False,
+                source_type=SourceType.PDF,
+                error=f"OCR processing failed: {e}",
+            )
     
     async def _process_markdown(self, content: bytes, payload: AttachmentPayload) -> ProcessingResult:
         """Process Markdown files with semantic chunking."""
@@ -312,76 +355,97 @@ class DocumentProcessor:
     async def _process_image(self, payload: AttachmentPayload) -> ProcessingResult:
         """
         Process images using Vision LLM for captioning.
+        Falls back to OCR if Vision API fails (e.g., quota exceeded).
         
         We embed the description, not the image pixels.
         """
+        description = None
+        used_ocr = False
+        
+        # Try Vision LLM first
         try:
             description = await self._describe_image_with_vision(payload.url)
-            
-            if not description:
+        except Exception as vision_error:
+            print(f"[IMAGE] Vision API failed: {vision_error}, trying OCR fallback")
+            # Fall back to OCR
+            try:
+                description = await self._ocr_image(payload.url)
+                used_ocr = True
+            except Exception as ocr_error:
                 return ProcessingResult(
                     success=False,
                     source_type=SourceType.IMAGE,
-                    error="Vision LLM returned empty description",
+                    error=f"Image processing failed. Vision: {vision_error}. OCR: {ocr_error}",
                 )
-            
-            # Single chunk for image description
-            chunks = [DocumentChunk(
-                text=description,
-                chunk_index=0,
-                chunk_type="image_caption",
-                heading_context=f"Image: {payload.filename}",
-            )]
-            
-            return ProcessingResult(
-                success=True,
-                source_type=SourceType.IMAGE,
-                description=description,
-                chunks=chunks,
-            )
-            
-        except Exception as e:
+        
+        if not description or not description.strip():
             return ProcessingResult(
                 success=False,
                 source_type=SourceType.IMAGE,
-                error=f"Image processing failed: {e}",
+                error="Could not extract any content from image",
             )
+        
+        # Single chunk for image description
+        chunk_type = "image_ocr" if used_ocr else "image_caption"
+        chunks = [DocumentChunk(
+            text=description,
+            chunk_index=0,
+            chunk_type=chunk_type,
+            heading_context=f"Image: {payload.filename}",
+        )]
+        
+        return ProcessingResult(
+            success=True,
+            source_type=SourceType.IMAGE,
+            description=description,
+            chunks=chunks,
+        )
+    
+    async def _ocr_image(self, image_url: str) -> str:
+        """Extract text from image using OCR (pytesseract)."""
+        import pytesseract
+        from PIL import Image
+        
+        # Download image
+        file_content = await self.download_file(image_url)
+        
+        # Open with PIL
+        img = Image.open(io.BytesIO(file_content))
+        
+        # Run OCR
+        text = pytesseract.image_to_string(img)
+        
+        if text.strip():
+            return f"Text extracted from image:\n{text.strip()}"
+        else:
+            return "Image contains no readable text (may be a photo or graphic)"
     
     async def _describe_image_with_vision(self, image_url: str) -> str:
         """
         Use Vision LLM to generate image description.
         
+        Supports Grok, Claude, and OpenAI based on configuration.
         Returns dense text description suitable for embedding.
         """
-        try:
-            from apps.api.src.core.config import get_settings
-            from langchain_openai import ChatOpenAI
-            from langchain_core.messages import HumanMessage
-            
-            settings = get_settings()
-            
-            if not settings.openai_api_key:
-                raise ValueError("OpenAI API key not configured for Vision")
-            
-            # Use GPT-4o for vision
-            llm = ChatOpenAI(
-                model="gpt-4o",
-                api_key=settings.openai_api_key,
-                max_tokens=500,
-            )
-            
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": "Describe this image in detail. Include: main subjects, actions, text visible, colors, and any important context. Be thorough but concise."},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            )
-            
-            response = await llm.ainvoke([message])
-            return response.content.strip()
-            
-        except ImportError:
-            raise ValueError("langchain-openai not installed")
+        from apps.api.src.core.llm_factory import get_vision_llm
+        from apps.api.src.core.config import get_settings
+        from langchain_core.messages import HumanMessage
+        
+        settings = get_settings()
+        provider = settings.active_vision_provider.value
+        print(f"[VISION] Using {provider} for image description")
+        
+        llm = get_vision_llm()
+        
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": "Describe this image in detail. Include: main subjects, actions, text visible, colors, and any important context. Be thorough but concise."},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        )
+        
+        response = await llm.ainvoke([message])
+        return response.content.strip()
     
     def _recursive_chunk(
         self,

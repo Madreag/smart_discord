@@ -434,6 +434,13 @@ async def handle_mention(message: discord.Message) -> None:
         await message.reply("Hey! Ask me anything by mentioning me with a question. For example: `@bot What is Python?`")
         return
     
+    # Check for attachments and enhance query with file context
+    if message.attachments:
+        attachment_names = [a.filename for a in message.attachments]
+        # Append attachment context to help vector search find document chunks
+        question = f"{question} [Attachments: {', '.join(attachment_names)}]"
+        print(f"[MENTION] Query with attachments: {question}")
+    
     # Show typing indicator while processing
     async with message.channel.typing():
         try:
@@ -463,7 +470,11 @@ async def handle_mention(message: discord.Message) -> None:
             await message.reply(embed=embed)
             
         except Exception as e:
-            await message.reply(f"Sorry, I encountered an error: {str(e)}")
+            import traceback
+            error_msg = str(e) or type(e).__name__
+            print(f"[MENTION ERROR] {error_msg}")
+            traceback.print_exc()
+            await message.reply(f"Sorry, I encountered an error: {error_msg}")
 
 
 @bot.event

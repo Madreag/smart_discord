@@ -121,6 +121,15 @@ def index_messages(self, payload_dict: dict) -> dict:
     if not success:
         raise Exception("Qdrant upsert failed")
     
+    # 5. Mark messages as indexed in PostgreSQL
+    with engine.connect() as conn:
+        conn.execute(text("""
+            UPDATE messages 
+            SET qdrant_point_id = :session_id, indexed_at = NOW()
+            WHERE id = ANY(:message_ids)
+        """), {"session_id": session_id, "message_ids": payload.message_ids})
+        conn.commit()
+    
     return {
         "status": "success",
         "guild_id": payload.guild_id,
@@ -262,6 +271,15 @@ def process_session(
     
     if not success:
         raise Exception("Qdrant upsert failed")
+    
+    # 5. Mark messages as indexed in PostgreSQL
+    with engine.connect() as conn:
+        conn.execute(text("""
+            UPDATE messages 
+            SET qdrant_point_id = :session_id, indexed_at = NOW()
+            WHERE id = ANY(:message_ids)
+        """), {"session_id": session_id, "message_ids": message_ids})
+        conn.commit()
     
     return {
         "status": "success",
@@ -698,14 +716,11 @@ def _embed_document_chunks(
     
     for chunk, chunk_id in zip(chunks, chunk_ids):
         try:
-            # Create embedding
-            from apps.api.src.core.config import get_settings
-            from langchain_openai import OpenAIEmbeddings
+            # Create embedding using factory (respects LOCAL/OPENAI config)
+            from apps.api.src.core.llm_factory import get_embedding_model
             
-            settings = get_settings()
-            embeddings = OpenAIEmbeddings(api_key=settings.openai_api_key)
-            
-            vector = embeddings.embed_query(chunk.text)
+            embedding_model = get_embedding_model()
+            vector = embedding_model.embed_query(chunk.text)
             
             # Upsert to Qdrant with document metadata
             point_id = chunk_id
@@ -742,10 +757,14 @@ def _embed_document_chunks(
     
     # Update attachment with qdrant_point_ids
     if qdrant_point_ids:
+        import uuid as uuid_module
+        # Convert string UUIDs to proper UUID objects for psycopg2
+        uuid_list = [uuid_module.UUID(pid) for pid in qdrant_point_ids]
         with engine.connect() as conn:
             conn.execute(text("""
                 UPDATE attachments 
-                SET qdrant_point_ids = :point_ids, indexed_at = NOW()
+                SET qdrant_point_ids = :point_ids, 
+                    indexed_at = NOW()
                 WHERE id = :id
-            """), {"id": attachment_id, "point_ids": qdrant_point_ids})
+            """), {"id": attachment_id, "point_ids": uuid_list})
             conn.commit()

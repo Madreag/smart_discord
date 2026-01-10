@@ -219,6 +219,7 @@ class QdrantService:
         channel_ids: Optional[list[int]] = None,
         limit: int = 5,
         score_threshold: float = 0.2,
+        source_types: Optional[list[str]] = None,
     ) -> list[dict]:
         """
         Search for similar vectors with multi-tenant filtering.
@@ -229,6 +230,7 @@ class QdrantService:
             channel_ids: Optional channel filter
             limit: Max results
             score_threshold: Minimum similarity score
+            source_types: Optional filter for source types (e.g., ['pdf', 'markdown'])
             
         Returns:
             List of results with id, score, payload
@@ -249,6 +251,15 @@ class QdrantService:
                 FieldCondition(
                     key="channel_id",
                     match=MatchAny(any=channel_ids),
+                )
+            )
+        
+        # Filter by source_type if specified (for document queries)
+        if source_types:
+            must_conditions.append(
+                FieldCondition(
+                    key="source_type",
+                    match=MatchAny(any=source_types),
                 )
             )
         
