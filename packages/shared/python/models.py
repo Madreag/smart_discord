@@ -98,6 +98,7 @@ class RouterIntent(str, Enum):
     """Intent classification for the Router Agent."""
     ANALYTICS_DB = "analytics_db"
     VECTOR_RAG = "vector_rag"
+    GRAPH_RAG = "graph_rag"  # Thematic/broad queries
     WEB_SEARCH = "web_search"
     GENERAL_KNOWLEDGE = "general_knowledge"
 

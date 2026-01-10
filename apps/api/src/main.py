@@ -125,6 +125,12 @@ async def ask(query: AskQuery) -> AskResponse:
                 query=query.query,
                 guild_id=query.guild_id,
             )
+        elif intent == RouterIntent.GRAPH_RAG:
+            from apps.api.src.agents.graphrag import process_graphrag_query
+            response = await process_graphrag_query(
+                query=query.query,
+                guild_id=query.guild_id,
+            )
         elif intent == RouterIntent.GENERAL_KNOWLEDGE:
             response = await process_general_knowledge_query(
                 query=query.query,

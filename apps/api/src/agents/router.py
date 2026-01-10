@@ -54,6 +54,18 @@ VECTOR_RAG_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b(what has been said|what did .* say)\b", re.IGNORECASE),
 ]
 
+GRAPH_RAG_PATTERNS: list[re.Pattern[str]] = [
+    # Thematic/broad queries about topics and trends
+    re.compile(r"\b(main|common|frequent|popular|major)\b.*\b(topics?|themes?|subjects?|discussions?)\b", re.IGNORECASE),
+    re.compile(r"\bwhat (do|does) (everyone|people|users?|members?) (talk|discuss|chat) about\b", re.IGNORECASE),
+    re.compile(r"\b(summarize|overview|summary of)\b.*\b(server|community|all)\b", re.IGNORECASE),
+    re.compile(r"\b(general|overall|common)\b.*\b(sentiment|opinion|feeling|mood)\b", re.IGNORECASE),
+    re.compile(r"\b(trends?|patterns?|themes?)\b.*\b(in|across|throughout)\b.*\b(server|community|channels?)\b", re.IGNORECASE),
+    # Big-picture questions
+    re.compile(r"\bwhat are the\b.*\b(main|biggest|most common|top)\b.*\b(complaints?|issues?|concerns?|problems?)\b", re.IGNORECASE),
+    re.compile(r"\b(analyze|analysis of)\b.*\b(conversations?|discussions?|community)\b", re.IGNORECASE),
+]
+
 WEB_SEARCH_PATTERNS: list[re.Pattern[str]] = [
     # External/current information
     re.compile(r"\b(latest|current|recent|today'?s?)\b.*\b(news|price|version|release)\b", re.IGNORECASE),
@@ -77,6 +89,11 @@ def _classify_by_pattern(query: str) -> Optional[RouterIntent]:
     for pattern in ANALYTICS_PATTERNS:
         if pattern.search(query):
             return RouterIntent.ANALYTICS_DB
+    
+    # Check graph RAG patterns (thematic/broad queries)
+    for pattern in GRAPH_RAG_PATTERNS:
+        if pattern.search(query):
+            return RouterIntent.GRAPH_RAG
     
     # Check web search patterns (external info)
     for pattern in WEB_SEARCH_PATTERNS:
@@ -116,8 +133,11 @@ Classify the user's query into exactly ONE of these categories:
 - analytics_db: Statistical queries about THIS SERVER's message counts, user activity, rankings, time-based metrics.
   Examples: "Who sent the most messages?", "How many messages last week?", "Most active channel?"
   
-- vector_rag: Semantic content queries about what was discussed IN THIS SERVER, topics, summaries, finding specific discussions.
-  Examples: "What are the main complaints?", "Summarize the React discussion", "What did John say about the bug?"
+- vector_rag: Semantic content queries about what was discussed, finding specific discussions or what someone said.
+  Examples: "Summarize the React discussion", "What did John say about the bug?", "Find messages about authentication"
+  
+- graph_rag: Broad thematic queries about overall topics, trends, or patterns across the ENTIRE server.
+  Examples: "What are the main topics people discuss?", "What are common complaints?", "Overview of server discussions"
   
 - web_search: Queries requiring external/current information that needs real-time web search.
   Examples: "Latest Python version?", "Current Bitcoin price?", "Today's news?"
@@ -136,6 +156,8 @@ Respond with ONLY the category name, nothing else."""
         
         if "analytics" in intent_str:
             return RouterIntent.ANALYTICS_DB
+        elif "graph" in intent_str:
+            return RouterIntent.GRAPH_RAG
         elif "web" in intent_str:
             return RouterIntent.WEB_SEARCH
         elif "general" in intent_str:
