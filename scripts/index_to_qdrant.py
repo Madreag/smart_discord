@@ -72,19 +72,44 @@ def index_messages(guild_id: int):
                 print(f"  No messages found")
                 continue
             
-            # Group messages into sessions (simple: every 10 messages)
-            session_size = 10
-            for i in range(0, len(messages), session_size):
-                batch = messages[i:i+session_size]
-                
+            # Convert to Message objects for hybrid sessionizer
+            from apps.bot.src.sessionizer import Message
+            from apps.bot.src.hybrid_sessionizer import hybrid_sessionize
+            
+            message_objs = [
+                Message(
+                    id=msg.id,
+                    channel_id=channel_id,
+                    author_id=msg.author_id,
+                    content=msg.content,
+                    timestamp=msg.message_timestamp,
+                    reply_to_id=None,
+                )
+                for msg in messages
+            ]
+            
+            # Build username lookup
+            username_map = {msg.author_id: msg.global_name or msg.username for msg in messages}
+            
+            # Use hybrid sessionizer (time + semantic)
+            print(f"  Applying hybrid sessionization ({len(messages)} messages)...")
+            sessions = hybrid_sessionize(
+                message_objs,
+                semantic_split_threshold=15,
+                min_session_size=2,
+                max_session_size=30,
+            )
+            print(f"  Created {len(sessions)} sessions")
+            
+            for session in sessions:
                 # Enrich messages
                 enriched_messages = [
                     {
-                        "content": msg.content,
-                        "author_name": msg.global_name or msg.username,
-                        "timestamp": msg.message_timestamp,
+                        "content": m.content,
+                        "author_name": username_map.get(m.author_id, f"User#{m.author_id}"),
+                        "timestamp": m.timestamp,
                     }
-                    for msg in batch
+                    for m in session.messages
                 ]
                 
                 enriched_text = enrich_session(enriched_messages, channel_name=channel_name)
@@ -94,8 +119,8 @@ def index_messages(guild_id: int):
                 
                 # Upsert to Qdrant
                 session_id = str(uuid4())
-                message_ids = [msg.id for msg in batch]
-                author_ids = list(set(msg.author_id for msg in batch))
+                message_ids = session.message_ids
+                author_ids = list(session.author_ids)
                 
                 success = qdrant_service.upsert_session(
                     session_id=session_id,
@@ -104,14 +129,13 @@ def index_messages(guild_id: int):
                     embedding=embedding,
                     message_ids=message_ids,
                     content_preview=enriched_text[:500],
-                    start_time=batch[0].message_timestamp.isoformat(),
-                    end_time=batch[-1].message_timestamp.isoformat(),
+                    start_time=session.start_time.isoformat() if session.start_time else "",
+                    end_time=session.end_time.isoformat() if session.end_time else "",
                     author_ids=author_ids,
                 )
                 
                 if success:
-                    total_indexed += len(batch)
-                    print(f"  Indexed session with {len(batch)} messages")
+                    total_indexed += len(session.messages)
                 else:
                     print(f"  Failed to index session")
         
