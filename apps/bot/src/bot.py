@@ -33,6 +33,10 @@ _db_engine = None
 
 # Note: DM conversation history is now stored in PostgreSQL + Qdrant (RAG memory)
 
+# Deduplication cache for processed messages (prevents double responses)
+_processed_messages: set[int] = set()
+_MAX_CACHE_SIZE = 1000
+
 def get_db_engine():
     """Get or create database engine."""
     global _db_engine
@@ -202,10 +206,9 @@ async def on_message_handler(message: discord.Message) -> None:
     Stores message directly in Postgres (bypasses Celery for local dev).
     Also responds to @mentions.
     """
+    global _processed_messages
+    
     try:
-        # Debug: Log all messages received
-        print(f"[DEBUG] Message received from {message.author}: {message.content[:50] if message.content else '(empty)'}...")
-        
         # Handle DMs separately (only from humans)
         if not message.guild:
             if not message.author.bot:
@@ -217,6 +220,11 @@ async def on_message_handler(message: discord.Message) -> None:
         
         # Don't process bot messages further (no responses to self)
         if message.author.bot:
+            return
+        
+        # Deduplication: Skip if we've already processed this message
+        if message.id in _processed_messages:
+            print(f"[DEBUG] Skipping duplicate message {message.id}")
             return
         
         # Check if bot was mentioned (user mention or role mention with bot's name)
@@ -235,6 +243,14 @@ async def on_message_handler(message: discord.Message) -> None:
                     break
         
         if bot_mentioned:
+            # Mark as processed BEFORE responding to prevent duplicates
+            _processed_messages.add(message.id)
+            
+            # Clean up cache if too large
+            if len(_processed_messages) > _MAX_CACHE_SIZE:
+                # Remove oldest entries (convert to list, slice, convert back)
+                _processed_messages = set(list(_processed_messages)[-500:])
+            
             print(f"Bot mentioned by {message.author}: {message.content}")
             await handle_mention(message)
             
@@ -340,35 +356,189 @@ async def handle_mention(message: discord.Message) -> None:
 
 
 @bot.event
-async def on_message_delete(message: discord.Message) -> None:
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     """
     Handle message deletion (Right to be Forgotten).
     
-    CONSTRAINT: Soft delete in Postgres, hard delete in Qdrant.
+    Uses raw event to catch ALL deletions, not just cached messages.
+    
+    Pipeline:
+    1. Soft delete in Postgres (preserve stats)
+    2. Hard delete from Qdrant (privacy compliance)
     """
-    if not message.guild:
+    if not payload.guild_id:
         return
     
-    # TODO: Get qdrant_point_id from Postgres
-    # For now, we'll use a placeholder
-    qdrant_point_id = None
+    message_id = payload.message_id
+    guild_id = payload.guild_id
     
-    if qdrant_point_id:
-        payload = DeleteTaskPayload(
-            guild_id=message.guild.id,
-            message_id=message.id,
-            qdrant_point_id=qdrant_point_id,
-        )
-        
-        # Queue deletion task
-        delete_message_vector.delay(payload.model_dump())
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Step 1: Soft delete in Postgres and get qdrant info
+            result = conn.execute(text("""
+                UPDATE messages 
+                SET 
+                    is_deleted = TRUE,
+                    updated_at = NOW(),
+                    content = '[deleted]'
+                WHERE id = :message_id 
+                  AND guild_id = :guild_id
+                RETURNING qdrant_point_id
+            """), {
+                "message_id": message_id,
+                "guild_id": guild_id,
+            })
+            
+            row = result.fetchone()
+            conn.commit()
+            
+            # Step 2: Queue Qdrant deletion if message was indexed
+            if row and row.qdrant_point_id:
+                delete_message_vector.delay({
+                    "guild_id": guild_id,
+                    "message_id": message_id,
+                    "qdrant_point_id": str(row.qdrant_point_id),
+                })
+                print(f"[DELETE] Queued Qdrant deletion for message {message_id}")
+            else:
+                print(f"[DELETE] Message {message_id} soft-deleted (not indexed)")
+                
+    except Exception as e:
+        print(f"[ERROR] on_raw_message_delete: {e}")
 
 
 @bot.event
-async def on_bulk_message_delete(messages: list[discord.Message]) -> None:
-    """Handle bulk message deletion."""
-    for message in messages:
-        await on_message_delete(message)
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
+    """
+    Handle bulk message deletion (e.g., channel purge).
+    
+    More efficient than handling each message individually.
+    """
+    if not payload.guild_id:
+        return
+    
+    message_ids = list(payload.message_ids)
+    guild_id = payload.guild_id
+    
+    if not message_ids:
+        return
+    
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Bulk soft delete in Postgres
+            result = conn.execute(text("""
+                UPDATE messages 
+                SET 
+                    is_deleted = TRUE,
+                    updated_at = NOW(),
+                    content = '[deleted]'
+                WHERE id = ANY(:message_ids)
+                  AND guild_id = :guild_id
+                RETURNING id, qdrant_point_id
+            """), {
+                "message_ids": message_ids,
+                "guild_id": guild_id,
+            })
+            
+            rows = result.fetchall()
+            conn.commit()
+            
+            # Get IDs of indexed messages that need Qdrant deletion
+            indexed_ids = [row.id for row in rows if row.qdrant_point_id]
+            
+            if indexed_ids:
+                # Queue bulk deletion
+                for msg_id in indexed_ids:
+                    row = next(r for r in rows if r.id == msg_id)
+                    delete_message_vector.delay({
+                        "guild_id": guild_id,
+                        "message_id": msg_id,
+                        "qdrant_point_id": str(row.qdrant_point_id),
+                    })
+                print(f"[BULK DELETE] Queued {len(indexed_ids)} messages for Qdrant deletion")
+            
+            print(f"[BULK DELETE] Soft-deleted {len(rows)} messages")
+                
+    except Exception as e:
+        print(f"[ERROR] on_raw_bulk_message_delete: {e}")
+
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
+    """
+    Handle message edits - update Postgres and mark for re-indexing.
+    
+    Uses raw event for reliability (catches edits on uncached messages).
+    
+    Pipeline:
+    1. Check if content actually changed
+    2. Update content in Postgres
+    3. Mark message as stale (needs re-indexing)
+    """
+    if not payload.guild_id:
+        return
+    
+    # Get message data from payload
+    data = payload.data
+    message_id = payload.message_id
+    guild_id = payload.guild_id
+    
+    # Check if this is a content edit (not just embed update)
+    new_content = data.get("content")
+    if new_content is None:
+        return
+    
+    # Skip bot messages
+    author = data.get("author", {})
+    if author.get("bot", False):
+        return
+    
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Get old content and check if it changed
+            old_result = conn.execute(text("""
+                SELECT content, qdrant_point_id
+                FROM messages
+                WHERE id = :message_id AND guild_id = :guild_id
+            """), {"message_id": message_id, "guild_id": guild_id})
+            
+            old_row = old_result.fetchone()
+            
+            if not old_row:
+                # Message not in our DB - might be from before bot joined
+                return
+            
+            old_content = old_row.content
+            qdrant_point_id = old_row.qdrant_point_id
+            
+            # Skip if content hasn't changed
+            if old_content == new_content:
+                return
+            
+            # Update content in Postgres (updated_at > indexed_at marks it as stale)
+            conn.execute(text("""
+                UPDATE messages
+                SET content = :content, updated_at = NOW()
+                WHERE id = :message_id AND guild_id = :guild_id
+            """), {
+                "content": new_content,
+                "message_id": message_id,
+                "guild_id": guild_id,
+            })
+            conn.commit()
+            
+            print(f"[EDIT] Updated message {message_id} in Postgres")
+            
+            # If message was indexed, it's now stale and will be re-indexed
+            # by the periodic sync job (updated_at > indexed_at)
+            if qdrant_point_id:
+                print(f"[EDIT] Message {message_id} marked stale for re-indexing")
+                
+    except Exception as e:
+        print(f"[ERROR] on_raw_message_edit: {e}")
 
 
 # =============================================================================

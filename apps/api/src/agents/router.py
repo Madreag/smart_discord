@@ -78,6 +78,34 @@ WEB_SEARCH_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b(price of|cost of|worth of)\b.*\b(bitcoin|eth|stock|crypto)\b", re.IGNORECASE),
 ]
 
+# Conversational patterns - statements that are NOT questions
+CONVERSATIONAL_PATTERNS: list[re.Pattern[str]] = [
+    # Informational statements (not questions)
+    re.compile(r"^(i|we|they|he|she|it)\s+(just|already|recently|have|had|am|was|will|did|made|updated|changed|fixed|added|removed)", re.IGNORECASE),
+    re.compile(r"^(just|already|recently)\s+(made|updated|changed|fixed|added|removed|deployed|pushed|released)", re.IGNORECASE),
+    # Greetings and acknowledgments
+    re.compile(r"^(hi|hello|hey|thanks|thank you|ok|okay|sure|cool|nice|great|awesome|got it|understood)\b", re.IGNORECASE),
+    # Status updates
+    re.compile(r"\b(made a change|updated|deployed|released|pushed|committed|merged)\b.*\b(to|the|a)\b", re.IGNORECASE),
+]
+
+
+def _is_conversational(query: str) -> bool:
+    """Check if the query is a conversational statement, not a question."""
+    # Check for question indicators
+    query_stripped = query.strip()
+    
+    # If it ends with a question mark, it's likely a question
+    if query_stripped.endswith("?"):
+        return False
+    
+    # Check conversational patterns
+    for pattern in CONVERSATIONAL_PATTERNS:
+        if pattern.search(query):
+            return True
+    
+    return False
+
 
 def _classify_by_pattern(query: str) -> Optional[RouterIntent]:
     """
@@ -186,6 +214,11 @@ async def classify_intent(query: str) -> RouterIntent:
     Returns:
         RouterIntent enum indicating where to route the query
     """
+    # Check for conversational statements first (not questions)
+    if _is_conversational(query):
+        print(f"[ROUTER] Conversational statement detected: {query[:50]}...")
+        return RouterIntent.GENERAL_KNOWLEDGE
+    
     # Try pattern-based classification first (fast, deterministic)
     pattern_result = _classify_by_pattern(query)
     if pattern_result is not None:
