@@ -277,9 +277,9 @@ class QdrantService:
         info = client.get_collection(COLLECTION_NAME)
         return {
             "name": COLLECTION_NAME,
-            "vectors_count": info.vectors_count,
+            "vectors_count": getattr(info, 'vectors_count', None) or info.points_count,
             "points_count": info.points_count,
-            "status": info.status.value,
+            "status": info.status.value if hasattr(info.status, 'value') else str(info.status),
         }
 
 

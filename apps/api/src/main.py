@@ -1172,6 +1172,54 @@ async def get_trending_topics(guild_id: int, days: int = 7) -> dict:
     }
 
 
+# =============================================================================
+# SYNC HEALTH ENDPOINTS
+# =============================================================================
+
+@app.get("/guilds/{guild_id}/sync-health")
+async def get_sync_health(guild_id: int) -> dict:
+    """
+    Get sync health metrics for a guild.
+    
+    Shows the synchronization status between PostgreSQL and Qdrant.
+    """
+    from apps.api.src.services.storage_service import storage_service
+    
+    health = storage_service.get_sync_health(guild_id)
+    
+    return {
+        "guild_id": health.guild_id,
+        "total_messages": health.total_messages,
+        "synced": health.synced,
+        "pending": health.pending,
+        "stale": health.stale,
+        "sync_percentage": health.sync_percentage,
+        "health": health.health,
+    }
+
+
+@app.post("/guilds/{guild_id}/sync-repair")
+async def repair_sync(guild_id: int, force: bool = False) -> dict:
+    """
+    Trigger sync repair for a guild.
+    
+    Args:
+        guild_id: Target guild
+        force: If True, re-indexes everything. If False, only pending/stale.
+    """
+    from apps.api.src.services.storage_service import storage_service
+    
+    count = storage_service.reset_sync_status(guild_id, force=force)
+    
+    return {
+        "guild_id": guild_id,
+        "messages_reset": count,
+        "force": force,
+        "status": "repair_queued",
+        "message": f"Reset {count} messages for re-indexing. Run indexing script to complete.",
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     

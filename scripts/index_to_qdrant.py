@@ -96,7 +96,7 @@ def index_messages(guild_id: int):
             sessions = hybrid_sessionize(
                 message_objs,
                 semantic_split_threshold=15,
-                min_session_size=2,
+                min_session_size=1,  # Allow single-message sessions for full sync
                 max_session_size=30,
             )
             print(f"  Created {len(sessions)} sessions")
@@ -136,6 +136,17 @@ def index_messages(guild_id: int):
                 
                 if success:
                     total_indexed += len(session.messages)
+                    
+                    # Mark messages as synced in Postgres
+                    try:
+                        from apps.api.src.services.storage_service import storage_service
+                        storage_service.mark_session_indexed(
+                            session_id=session_id,
+                            qdrant_point_id=session_id,
+                            message_ids=message_ids,
+                        )
+                    except Exception as e:
+                        print(f"  Warning: Could not mark as indexed: {e}")
                 else:
                     print(f"  Failed to index session")
         
