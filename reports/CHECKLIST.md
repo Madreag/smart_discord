@@ -10,7 +10,7 @@
 
 - [X]**Real Dashboard Analytics** (REPORT11) — Replace placeholder stats with real data
 - [X]**Metadata Enrichment** (REPORT2) — Add author/channel/time context to embeddings
-- [ ]**Right to be Forgotten** (REPORT3) — Complete Qdrant hard-delete on message delete
+- [X]**Right to be Forgotten** (REPORT3) — Complete Qdrant hard-delete on message delete
 
 ## P2 - Medium
 

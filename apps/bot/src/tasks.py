@@ -141,6 +141,117 @@ def index_messages(self, payload_dict: dict) -> dict:
 
 @celery_app.task(
     bind=True,
+    name="index_single_message",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=60,
+    max_retries=3,
+)
+def index_single_message(
+    self,
+    guild_id: int,
+    channel_id: int,
+    channel_name: str,
+    message_id: int,
+) -> dict:
+    """
+    Index a single message to Qdrant for real-time searchability.
+    
+    Called immediately after a message is saved to Postgres.
+    Creates a single-message session for immediate RAG availability.
+    
+    Args:
+        guild_id: Guild ID
+        channel_id: Channel ID
+        channel_name: Channel name for context
+        message_id: Message ID to index
+        
+    Returns:
+        Result dict with indexing status
+    """
+    from sqlalchemy import text
+    from apps.api.src.core.llm_factory import get_embedding_model
+    from apps.api.src.services.qdrant_service import qdrant_service
+    from apps.api.src.services.enrichment_service import enrich_session
+    
+    print(f"[TASK] index_single_message: {message_id} in #{channel_name}")
+    
+    engine = get_db_engine()
+    
+    # 1. Fetch message from Postgres
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT m.id, m.content, m.message_timestamp, m.author_id,
+                   u.username, u.global_name
+            FROM messages m
+            JOIN users u ON m.author_id = u.id
+            WHERE m.id = :message_id
+              AND m.guild_id = :guild_id
+              AND m.is_deleted = FALSE
+              AND m.qdrant_point_id IS NULL
+              AND m.content IS NOT NULL 
+              AND LENGTH(m.content) > 0
+        """), {"message_id": message_id, "guild_id": guild_id})
+        
+        row = result.fetchone()
+    
+    if not row:
+        return {"status": "skipped", "reason": "message_not_found_or_already_indexed"}
+    
+    # 2. Enrich message with metadata
+    messages = [{
+        "content": row.content,
+        "author_name": row.global_name or row.username,
+        "timestamp": row.message_timestamp,
+    }]
+    
+    enriched_text = enrich_session(messages, channel_name=channel_name)
+    
+    # 3. Generate embedding
+    embedding_model = get_embedding_model()
+    embedding = embedding_model.embed_query(enriched_text)
+    
+    # 4. Upsert to Qdrant
+    session_id = str(uuid4())
+    timestamp_str = row.message_timestamp.isoformat() if row.message_timestamp else datetime.utcnow().isoformat()
+    
+    success = qdrant_service.upsert_session(
+        session_id=session_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        embedding=embedding,
+        message_ids=[message_id],
+        content_preview=enriched_text[:500],
+        start_time=timestamp_str,
+        end_time=timestamp_str,
+        author_ids=[row.author_id],
+    )
+    
+    if not success:
+        raise Exception("Qdrant upsert failed")
+    
+    # 5. Mark message as indexed in PostgreSQL
+    with engine.connect() as conn:
+        conn.execute(text("""
+            UPDATE messages 
+            SET qdrant_point_id = :session_id, indexed_at = NOW()
+            WHERE id = :message_id
+        """), {"session_id": session_id, "message_id": message_id})
+        conn.commit()
+    
+    print(f"[TASK] Indexed message {message_id} -> session {session_id}")
+    
+    return {
+        "status": "success",
+        "message_id": message_id,
+        "session_id": session_id,
+        "guild_id": guild_id,
+        "channel_id": channel_id,
+    }
+
+
+@celery_app.task(
+    bind=True,
     name="delete_message_vector",
     autoretry_for=(Exception,),
     retry_backoff=True,
@@ -178,6 +289,73 @@ def delete_message_vector(self, payload_dict: dict) -> dict:
         "guild_id": payload.guild_id,
         "message_id": payload.message_id,
         "reason": "no_qdrant_point_id",
+    }
+
+
+@celery_app.task(
+    bind=True,
+    name="delete_sessions_for_messages",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    max_retries=3,
+)
+def delete_sessions_for_messages(
+    self,
+    guild_id: int,
+    message_ids: list[int],
+) -> dict:
+    """
+    Delete all Qdrant sessions containing deleted messages (Right to be Forgotten).
+    
+    This ensures deleted message content is completely removed from RAG responses.
+    Sessions containing deleted messages are removed entirely, then the remaining
+    messages can be re-indexed by the periodic sync job.
+    
+    Args:
+        guild_id: Guild ID for multi-tenant filtering
+        message_ids: List of deleted message IDs
+        
+    Returns:
+        Result dict with deletion status
+    """
+    from apps.api.src.services.qdrant_service import qdrant_service
+    from sqlalchemy import text
+    
+    print(f"[TASK] delete_sessions_for_messages: guild={guild_id}, messages={message_ids}")
+    
+    # Delete sessions from Qdrant
+    result = qdrant_service.delete_sessions_containing_messages(
+        guild_id=guild_id,
+        message_ids=message_ids,
+    )
+    
+    # Clear qdrant_point_id from affected messages so they can be re-indexed
+    if result.get("deleted_count", 0) > 0:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            # Clear qdrant_point_id for non-deleted messages that were in deleted sessions
+            # This allows them to be re-indexed in new sessions
+            conn.execute(text("""
+                UPDATE messages 
+                SET qdrant_point_id = NULL, indexed_at = NULL
+                WHERE guild_id = :guild_id 
+                  AND qdrant_point_id IS NOT NULL
+                  AND is_deleted = FALSE
+                  AND qdrant_point_id::text = ANY(:session_ids)
+            """), {
+                "guild_id": guild_id,
+                "session_ids": result.get("session_ids", []),
+            })
+            conn.commit()
+        
+        print(f"[TASK] Cleared qdrant_point_id for messages in {result['deleted_count']} deleted sessions")
+    
+    return {
+        "status": "success",
+        "guild_id": guild_id,
+        "message_ids": message_ids,
+        "deleted_sessions": result.get("deleted_count", 0),
+        "session_ids": result.get("session_ids", []),
     }
 
 

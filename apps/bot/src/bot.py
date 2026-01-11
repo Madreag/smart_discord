@@ -231,10 +231,36 @@ def save_message_to_db(message: "discord.Message") -> bool:
                     _queue_attachment_processing(attachment, message.guild.id, message.channel.id)
             
             conn.commit()
+            
+            # Queue real-time indexing to Qdrant (non-blocking)
+            # Skip bot messages and empty content
+            if not message.author.bot and message.content and message.content.strip():
+                _queue_message_for_indexing(message)
+            
             return True
     except Exception as e:
         print(f"Error saving message to DB: {e}")
         return False
+
+
+def _queue_message_for_indexing(message: "discord.Message") -> None:
+    """
+    Queue a message for real-time indexing to Qdrant.
+    
+    This enables immediate searchability of new messages.
+    """
+    try:
+        from apps.bot.src.tasks import index_single_message
+        
+        index_single_message.delay(
+            guild_id=message.guild.id,
+            channel_id=message.channel.id,
+            channel_name=message.channel.name,
+            message_id=message.id,
+        )
+    except Exception as e:
+        # Don't fail message save if indexing queue fails
+        print(f"[WARNING] Failed to queue message for indexing: {e}")
 
 
 # Bot setup with required intents
@@ -485,8 +511,11 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     Uses raw event to catch ALL deletions, not just cached messages.
     
     Pipeline:
-    1. Soft delete in Postgres (preserve stats)
-    2. Hard delete from Qdrant (privacy compliance)
+    1. Soft delete in Postgres (preserve stats, clear content)
+    2. Delete ALL Qdrant sessions containing this message (complete removal)
+    3. Clear qdrant_point_id so remaining messages can be re-indexed
+    
+    GDPR/CCPA Compliance: Deleted message content must not appear in RAG responses.
     """
     if not payload.guild_id:
         return
@@ -497,11 +526,12 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     try:
         engine = get_db_engine()
         with engine.connect() as conn:
-            # Step 1: Soft delete message in Postgres and get qdrant info
+            # Step 1: Soft delete message in Postgres and clear content
             result = conn.execute(text("""
                 UPDATE messages 
                 SET 
                     is_deleted = TRUE,
+                    deleted_at = NOW(),
                     updated_at = NOW(),
                     content = '[deleted]'
                 WHERE id = :message_id 
@@ -528,16 +558,14 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
             
             conn.commit()
             
-            # Step 3: Queue Qdrant deletion for message if indexed
-            if row and row.qdrant_point_id:
-                delete_message_vector.delay({
-                    "guild_id": guild_id,
-                    "message_id": message_id,
-                    "qdrant_point_id": str(row.qdrant_point_id),
-                })
-                print(f"[DELETE] Queued Qdrant deletion for message {message_id}")
-            else:
-                print(f"[DELETE] Message {message_id} soft-deleted (not indexed)")
+            # Step 3: Queue comprehensive Qdrant session deletion
+            # This finds and deletes ALL sessions containing this message
+            from apps.bot.src.tasks import delete_sessions_for_messages
+            delete_sessions_for_messages.delay(
+                guild_id=guild_id,
+                message_ids=[message_id],
+            )
+            print(f"[DELETE] Queued session deletion for message {message_id}")
             
             # Step 4: Queue Qdrant deletion for attachments
             for attach_row in attachment_rows:
@@ -560,6 +588,7 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
     Handle bulk message deletion (e.g., channel purge).
     
     More efficient than handling each message individually.
+    Uses comprehensive session deletion for GDPR/CCPA compliance.
     """
     if not payload.guild_id:
         return
@@ -578,6 +607,7 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
                 UPDATE messages 
                 SET 
                     is_deleted = TRUE,
+                    deleted_at = NOW(),
                     updated_at = NOW(),
                     content = '[deleted]'
                 WHERE id = ANY(:message_ids)
@@ -589,23 +619,28 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
             })
             
             rows = result.fetchall()
+            
+            # Also delete attachments for these messages
+            conn.execute(text("""
+                UPDATE attachments
+                SET is_deleted = TRUE, deleted_at = NOW(), updated_at = NOW()
+                WHERE message_id = ANY(:message_ids) AND guild_id = :guild_id
+            """), {
+                "message_ids": message_ids,
+                "guild_id": guild_id,
+            })
+            
             conn.commit()
             
-            # Get IDs of indexed messages that need Qdrant deletion
-            indexed_ids = [row.id for row in rows if row.qdrant_point_id]
+            # Queue comprehensive session deletion for all deleted messages
+            # This is more efficient than individual deletions
+            from apps.bot.src.tasks import delete_sessions_for_messages
+            delete_sessions_for_messages.delay(
+                guild_id=guild_id,
+                message_ids=message_ids,
+            )
             
-            if indexed_ids:
-                # Queue bulk deletion
-                for msg_id in indexed_ids:
-                    row = next(r for r in rows if r.id == msg_id)
-                    delete_message_vector.delay({
-                        "guild_id": guild_id,
-                        "message_id": msg_id,
-                        "qdrant_point_id": str(row.qdrant_point_id),
-                    })
-                print(f"[BULK DELETE] Queued {len(indexed_ids)} messages for Qdrant deletion")
-            
-            print(f"[BULK DELETE] Soft-deleted {len(rows)} messages")
+            print(f"[BULK DELETE] Soft-deleted {len(rows)} messages, queued session cleanup")
                 
     except Exception as e:
         print(f"[ERROR] on_raw_bulk_message_delete: {e}")

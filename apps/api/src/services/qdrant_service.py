@@ -314,6 +314,156 @@ class QdrantService:
         
         return result.status == UpdateStatus.COMPLETED
     
+    def delete_sessions_containing_messages(
+        self,
+        guild_id: int,
+        message_ids: list[int],
+    ) -> dict:
+        """
+        Delete all sessions that contain any of the specified message IDs.
+        
+        This is used for "Right to be Forgotten" compliance - when a message
+        is deleted, all sessions containing that message must be removed
+        from the vector database to prevent the deleted content from
+        appearing in RAG responses.
+        
+        Args:
+            guild_id: Guild ID for multi-tenant filtering
+            message_ids: List of message IDs that were deleted
+            
+        Returns:
+            Dict with deleted_count and session_ids
+        """
+        client = self.get_client()
+        deleted_session_ids = []
+        
+        try:
+            # Scroll through all sessions for this guild and find ones containing deleted messages
+            # This is necessary because Qdrant doesn't support "array contains any" filtering
+            offset = None
+            batch_size = 100
+            
+            while True:
+                results = client.scroll(
+                    collection_name=COLLECTION_NAME,
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="guild_id",
+                                match=MatchValue(value=guild_id),
+                            ),
+                        ]
+                    ),
+                    limit=batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                
+                points, next_offset = results
+                
+                if not points:
+                    break
+                
+                # Check each session for deleted message IDs
+                for point in points:
+                    payload = point.payload or {}
+                    session_message_ids = payload.get("message_ids", [])
+                    
+                    # If any deleted message is in this session, mark for deletion
+                    if any(mid in session_message_ids for mid in message_ids):
+                        deleted_session_ids.append(str(point.id))
+                
+                if next_offset is None:
+                    break
+                offset = next_offset
+            
+            # Delete all found sessions
+            if deleted_session_ids:
+                client.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=models.PointIdsList(
+                        points=deleted_session_ids,
+                    ),
+                )
+                print(f"[QDRANT] Deleted {len(deleted_session_ids)} sessions containing deleted messages")
+            
+            return {
+                "deleted_count": len(deleted_session_ids),
+                "session_ids": deleted_session_ids,
+            }
+            
+        except Exception as e:
+            print(f"[QDRANT ERROR] delete_sessions_containing_messages: {e}")
+            return {"deleted_count": 0, "session_ids": [], "error": str(e)}
+    
+    def get_sessions_by_message_ids(
+        self,
+        guild_id: int,
+        message_ids: list[int],
+    ) -> list[dict]:
+        """
+        Find all sessions containing any of the specified message IDs.
+        
+        Useful for checking if a message is indexed before deletion.
+        
+        Args:
+            guild_id: Guild ID for filtering
+            message_ids: Message IDs to search for
+            
+        Returns:
+            List of session dicts with id and message_ids
+        """
+        client = self.get_client()
+        found_sessions = []
+        
+        try:
+            offset = None
+            batch_size = 100
+            
+            while True:
+                results = client.scroll(
+                    collection_name=COLLECTION_NAME,
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="guild_id",
+                                match=MatchValue(value=guild_id),
+                            ),
+                        ]
+                    ),
+                    limit=batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                
+                points, next_offset = results
+                
+                if not points:
+                    break
+                
+                for point in points:
+                    payload = point.payload or {}
+                    session_message_ids = payload.get("message_ids", [])
+                    
+                    if any(mid in session_message_ids for mid in message_ids):
+                        found_sessions.append({
+                            "session_id": str(point.id),
+                            "message_ids": session_message_ids,
+                            "channel_id": payload.get("channel_id"),
+                        })
+                
+                if next_offset is None:
+                    break
+                offset = next_offset
+            
+            return found_sessions
+            
+        except Exception as e:
+            print(f"[QDRANT ERROR] get_sessions_by_message_ids: {e}")
+            return []
+    
     def get_collection_info(self) -> dict:
         """Get collection statistics."""
         self.ensure_collection()
