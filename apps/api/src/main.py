@@ -177,10 +177,22 @@ async def ask(query: AskQuery) -> AskResponse:
                     guild_id=query.guild_id,
                 )
             elif intent == RouterIntent.GENERAL_KNOWLEDGE:
-                response = await process_general_knowledge_query(
-                    query=safe_query,
-                    guild_id=query.guild_id,
-                )
+                # When channel_id is provided, use vector_rag to check recent messages first
+                # This allows context-aware responses for questions about recent chat
+                if query.channel_id:
+                    response = await process_rag_query(
+                        query=safe_query,
+                        guild_id=query.guild_id,
+                        channel_ids=query.channel_ids,
+                        channel_id=query.channel_id,
+                    )
+                    # Override routed_to to indicate it was general_knowledge -> vector_rag
+                    response.routed_to = RouterIntent.VECTOR_RAG
+                else:
+                    response = await process_general_knowledge_query(
+                        query=safe_query,
+                        guild_id=query.guild_id,
+                    )
             else:
                 raise HTTPException(
                     status_code=500,

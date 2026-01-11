@@ -111,3 +111,114 @@ class ConversationMemory:
 
 # Global instance
 conversation_memory = ConversationMemory()
+
+
+def get_recent_channel_messages(
+    guild_id: int,
+    channel_id: int,
+    limit: int = 30,
+) -> list[dict]:
+    """
+    Fetch the last N messages from a channel from PostgreSQL.
+    
+    This provides short-term memory without needing RAG/Qdrant.
+    Messages are returned in chronological order (oldest first).
+    
+    Args:
+        guild_id: Guild ID for multi-tenant filtering
+        channel_id: Channel ID to fetch messages from
+        limit: Maximum number of messages (default 30)
+        
+    Returns:
+        List of message dicts with author_name, content, timestamp
+    """
+    from sqlalchemy import create_engine, text
+    from apps.api.src.core.config import get_settings
+    
+    settings = get_settings()
+    sync_url = settings.database_url.replace("+asyncpg", "")
+    engine = create_engine(sync_url, pool_pre_ping=True)
+    
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT m.content, m.message_timestamp, 
+                   u.username, u.global_name
+            FROM messages m
+            JOIN users u ON m.author_id = u.id
+            WHERE m.guild_id = :guild_id
+              AND m.channel_id = :channel_id
+              AND m.is_deleted = FALSE
+              AND m.content IS NOT NULL
+              AND LENGTH(m.content) > 0
+            ORDER BY m.message_timestamp DESC
+            LIMIT :limit
+        """), {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "limit": limit,
+        })
+        
+        rows = result.fetchall()
+    
+    # Reverse to get chronological order (oldest first)
+    messages = []
+    for row in reversed(rows):
+        messages.append({
+            "author_name": row.global_name or row.username,
+            "content": row.content,
+            "timestamp": row.message_timestamp,
+        })
+    
+    return messages
+
+
+def format_recent_messages_as_context(messages: list[dict]) -> str:
+    """
+    Format recent messages as text context for LLM.
+    
+    Args:
+        messages: List of message dicts from get_recent_channel_messages
+        
+    Returns:
+        Formatted string of recent messages
+    """
+    if not messages:
+        return ""
+    
+    lines = []
+    for msg in messages:
+        timestamp = msg["timestamp"]
+        time_str = timestamp.strftime("%H:%M") if timestamp else ""
+        lines.append(f"[{time_str}] {msg['author_name']}: {msg['content']}")
+    
+    return "\n".join(lines)
+
+
+def search_recent_messages(
+    messages: list[dict],
+    query: str,
+    case_sensitive: bool = False,
+) -> list[dict]:
+    """
+    Simple text search through recent messages.
+    
+    For queries about recent activity, this avoids the need for vector search.
+    
+    Args:
+        messages: List of message dicts
+        query: Search query
+        case_sensitive: Whether to match case
+        
+    Returns:
+        Matching messages
+    """
+    if not case_sensitive:
+        query = query.lower()
+    
+    matches = []
+    for msg in messages:
+        content = msg["content"] if case_sensitive else msg["content"].lower()
+        if query in content:
+            matches.append(msg)
+    
+    return matches

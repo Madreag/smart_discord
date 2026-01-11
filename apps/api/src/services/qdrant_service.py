@@ -19,6 +19,14 @@ from qdrant_client.http.models import (
     MatchAny,
     PayloadSchemaType,
     UpdateStatus,
+    SparseVectorParams,
+    SparseIndexParams,
+    SparseVector,
+    Prefetch,
+    FusionQuery,
+    Fusion,
+    NamedVector,
+    NamedSparseVector,
 )
 
 from apps.api.src.core.config import get_settings
@@ -27,6 +35,11 @@ from apps.api.src.core.llm_factory import get_embedding_model
 
 # Collection configuration
 COLLECTION_NAME = "discord_sessions"
+HYBRID_COLLECTION_NAME = "discord_sessions_hybrid"
+
+# Named vector configuration
+DENSE_VECTOR_NAME = "dense"
+SPARSE_VECTOR_NAME = "sparse"
 
 
 def get_vector_size() -> int:
@@ -475,6 +488,429 @@ class QdrantService:
             "vectors_count": getattr(info, 'vectors_count', None) or info.points_count,
             "points_count": info.points_count,
             "status": info.status.value if hasattr(info.status, 'value') else str(info.status),
+        }
+    
+    # ==================== HYBRID SEARCH METHODS ====================
+    
+    def ensure_hybrid_collection(self) -> None:
+        """
+        Create hybrid collection with named dense + sparse vectors.
+        
+        This collection supports:
+        - Dense vectors (semantic similarity)
+        - Sparse vectors (BM25 keyword matching)
+        - RRF fusion for hybrid search
+        """
+        client = self.get_client()
+        vector_size = get_vector_size()
+        
+        collections = client.get_collections()
+        existing = [c.name for c in collections.collections]
+        
+        if HYBRID_COLLECTION_NAME not in existing:
+            client.create_collection(
+                collection_name=HYBRID_COLLECTION_NAME,
+                vectors_config={
+                    DENSE_VECTOR_NAME: VectorParams(
+                        size=vector_size,
+                        distance=Distance.COSINE,
+                    ),
+                },
+                sparse_vectors_config={
+                    SPARSE_VECTOR_NAME: SparseVectorParams(
+                        index=SparseIndexParams(
+                            on_disk=False,
+                        ),
+                    ),
+                },
+                optimizers_config=models.OptimizersConfigDiff(
+                    indexing_threshold=10000,
+                ),
+            )
+            
+            # Create payload indexes for efficient filtering
+            client.create_payload_index(
+                collection_name=HYBRID_COLLECTION_NAME,
+                field_name="guild_id",
+                field_schema=PayloadSchemaType.INTEGER,
+            )
+            client.create_payload_index(
+                collection_name=HYBRID_COLLECTION_NAME,
+                field_name="channel_id",
+                field_schema=PayloadSchemaType.INTEGER,
+            )
+            client.create_payload_index(
+                collection_name=HYBRID_COLLECTION_NAME,
+                field_name="source_type",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+            
+            print(f"[HYBRID] Created collection: {HYBRID_COLLECTION_NAME} with dense ({vector_size}D) + sparse vectors")
+    
+    def upsert_hybrid(
+        self,
+        point_id: str,
+        dense_vector: list[float],
+        sparse_indices: list[int],
+        sparse_values: list[float],
+        payload: dict,
+    ) -> bool:
+        """
+        Upsert a point with both dense and sparse vectors.
+        
+        Args:
+            point_id: Unique point ID
+            dense_vector: Dense embedding vector
+            sparse_indices: BM25 sparse vector indices
+            sparse_values: BM25 sparse vector values
+            payload: Metadata payload (must include guild_id)
+            
+        Returns:
+            True if successful
+        """
+        self.ensure_hybrid_collection()
+        client = self.get_client()
+        
+        # Build vector dict with named vectors
+        vectors = {
+            DENSE_VECTOR_NAME: dense_vector,
+        }
+        
+        # Only add sparse vector if we have data
+        if sparse_indices and sparse_values:
+            vectors[SPARSE_VECTOR_NAME] = SparseVector(
+                indices=sparse_indices,
+                values=sparse_values,
+            )
+        
+        result = client.upsert(
+            collection_name=HYBRID_COLLECTION_NAME,
+            points=[
+                PointStruct(
+                    id=point_id,
+                    vector=vectors,
+                    payload=payload,
+                ),
+            ],
+            wait=True,
+        )
+        
+        return result.status == UpdateStatus.COMPLETED
+    
+    def upsert_hybrid_batch(self, points: list[dict]) -> bool:
+        """
+        Batch upsert points with hybrid vectors.
+        
+        Args:
+            points: List of dicts with keys:
+                - id: Point ID
+                - dense_vector: Dense embedding
+                - sparse_indices: BM25 indices
+                - sparse_values: BM25 values
+                - payload: Metadata
+                
+        Returns:
+            True if successful
+        """
+        self.ensure_hybrid_collection()
+        client = self.get_client()
+        
+        qdrant_points = []
+        for p in points:
+            vectors = {
+                DENSE_VECTOR_NAME: p["dense_vector"],
+            }
+            if p.get("sparse_indices") and p.get("sparse_values"):
+                vectors[SPARSE_VECTOR_NAME] = SparseVector(
+                    indices=p["sparse_indices"],
+                    values=p["sparse_values"],
+                )
+            
+            qdrant_points.append(
+                PointStruct(
+                    id=p["id"],
+                    vector=vectors,
+                    payload=p["payload"],
+                )
+            )
+        
+        result = client.upsert(
+            collection_name=HYBRID_COLLECTION_NAME,
+            points=qdrant_points,
+            wait=True,
+        )
+        
+        return result.status == UpdateStatus.COMPLETED
+    
+    def hybrid_search(
+        self,
+        query_dense: list[float],
+        query_sparse_indices: list[int],
+        query_sparse_values: list[float],
+        guild_id: int,
+        channel_ids: Optional[list[int]] = None,
+        limit: int = 5,
+        score_threshold: float = 0.0,
+        source_types: Optional[list[str]] = None,
+        dense_weight: float = 0.7,
+        sparse_weight: float = 0.3,
+    ) -> list[dict]:
+        """
+        Hybrid search combining dense (semantic) and sparse (BM25) vectors.
+        
+        Uses Reciprocal Rank Fusion (RRF) to combine results from both
+        dense and sparse searches.
+        
+        Args:
+            query_dense: Dense query embedding
+            query_sparse_indices: BM25 sparse indices
+            query_sparse_values: BM25 sparse values
+            guild_id: Guild ID for filtering (REQUIRED)
+            channel_ids: Optional channel filter
+            limit: Max results
+            score_threshold: Minimum score threshold
+            source_types: Optional source type filter
+            dense_weight: Weight for dense results (default 0.7)
+            sparse_weight: Weight for sparse results (default 0.3)
+            
+        Returns:
+            List of results with id, score, payload
+        """
+        self.ensure_hybrid_collection()
+        client = self.get_client()
+        
+        # Build filter - guild_id is ALWAYS required
+        must_conditions = [
+            FieldCondition(
+                key="guild_id",
+                match=MatchValue(value=guild_id),
+            ),
+        ]
+        
+        if channel_ids:
+            must_conditions.append(
+                FieldCondition(
+                    key="channel_id",
+                    match=MatchAny(any=channel_ids),
+                )
+            )
+        
+        if source_types:
+            must_conditions.append(
+                FieldCondition(
+                    key="source_type",
+                    match=MatchAny(any=source_types),
+                )
+            )
+        
+        query_filter = Filter(must=must_conditions)
+        
+        # Build prefetch queries for RRF fusion
+        prefetch_queries = []
+        
+        # Dense (semantic) search prefetch
+        prefetch_queries.append(
+            Prefetch(
+                query=query_dense,
+                using=DENSE_VECTOR_NAME,
+                limit=limit * 3,  # Oversample for fusion
+                filter=query_filter,
+            )
+        )
+        
+        # Sparse (BM25) search prefetch - only if we have sparse data
+        if query_sparse_indices and query_sparse_values:
+            prefetch_queries.append(
+                Prefetch(
+                    query=SparseVector(
+                        indices=query_sparse_indices,
+                        values=query_sparse_values,
+                    ),
+                    using=SPARSE_VECTOR_NAME,
+                    limit=limit * 3,
+                    filter=query_filter,
+                )
+            )
+        
+        # Execute hybrid search with RRF fusion
+        try:
+            results = client.query_points(
+                collection_name=HYBRID_COLLECTION_NAME,
+                prefetch=prefetch_queries,
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=limit,
+                with_payload=True,
+            )
+            
+            return [
+                {
+                    "id": str(r.id),
+                    "score": r.score,
+                    "payload": r.payload,
+                }
+                for r in results.points
+                if r.score >= score_threshold
+            ]
+            
+        except Exception as e:
+            print(f"[HYBRID] Search error: {e}")
+            # Fallback to dense-only search
+            return self._dense_only_search(
+                query_dense, guild_id, channel_ids, limit, score_threshold, source_types
+            )
+    
+    def _dense_only_search(
+        self,
+        query_dense: list[float],
+        guild_id: int,
+        channel_ids: Optional[list[int]] = None,
+        limit: int = 5,
+        score_threshold: float = 0.2,
+        source_types: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """Fallback dense-only search on hybrid collection."""
+        client = self.get_client()
+        
+        must_conditions = [
+            FieldCondition(
+                key="guild_id",
+                match=MatchValue(value=guild_id),
+            ),
+        ]
+        
+        if channel_ids:
+            must_conditions.append(
+                FieldCondition(
+                    key="channel_id",
+                    match=MatchAny(any=channel_ids),
+                )
+            )
+        
+        if source_types:
+            must_conditions.append(
+                FieldCondition(
+                    key="source_type",
+                    match=MatchAny(any=source_types),
+                )
+            )
+        
+        results = client.query_points(
+            collection_name=HYBRID_COLLECTION_NAME,
+            query=query_dense,
+            using=DENSE_VECTOR_NAME,
+            query_filter=Filter(must=must_conditions),
+            limit=limit,
+            score_threshold=score_threshold,
+            with_payload=True,
+        )
+        
+        return [
+            {
+                "id": str(r.id),
+                "score": r.score,
+                "payload": r.payload,
+            }
+            for r in results.points
+        ]
+    
+    def get_hybrid_collection_info(self) -> dict:
+        """Get hybrid collection statistics."""
+        self.ensure_hybrid_collection()
+        client = self.get_client()
+        
+        info = client.get_collection(HYBRID_COLLECTION_NAME)
+        return {
+            "name": HYBRID_COLLECTION_NAME,
+            "vectors_count": getattr(info, 'vectors_count', None) or info.points_count,
+            "points_count": info.points_count,
+            "status": info.status.value if hasattr(info.status, 'value') else str(info.status),
+            "hybrid_enabled": True,
+        }
+    
+    def migrate_to_hybrid(self, batch_size: int = 100) -> dict:
+        """
+        Migrate existing points from legacy collection to hybrid collection.
+        
+        This re-indexes all points with both dense and sparse vectors.
+        
+        Args:
+            batch_size: Number of points to process per batch
+            
+        Returns:
+            Dict with migration stats
+        """
+        from apps.api.src.services.hybrid_embedding import get_hybrid_embedding_model
+        
+        client = self.get_client()
+        self.ensure_hybrid_collection()
+        
+        hybrid_model = get_hybrid_embedding_model()
+        migrated = 0
+        errors = 0
+        offset = None
+        
+        print(f"[HYBRID] Starting migration from {COLLECTION_NAME} to {HYBRID_COLLECTION_NAME}")
+        
+        while True:
+            # Scroll through legacy collection
+            results = client.scroll(
+                collection_name=COLLECTION_NAME,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=True,
+            )
+            
+            points, next_offset = results
+            
+            if not points:
+                break
+            
+            # Process batch
+            hybrid_points = []
+            for point in points:
+                try:
+                    payload = point.payload or {}
+                    content = payload.get("content", "")
+                    
+                    # Get dense vector from existing point
+                    dense_vector = point.vector if isinstance(point.vector, list) else list(point.vector)
+                    
+                    # Generate sparse embedding for content
+                    if content and hybrid_model.sparse_enabled:
+                        hybrid_emb = hybrid_model.embed_document(content)
+                        sparse_indices = hybrid_emb.sparse_indices
+                        sparse_values = hybrid_emb.sparse_values
+                    else:
+                        sparse_indices = []
+                        sparse_values = []
+                    
+                    hybrid_points.append({
+                        "id": str(point.id),
+                        "dense_vector": dense_vector,
+                        "sparse_indices": sparse_indices,
+                        "sparse_values": sparse_values,
+                        "payload": payload,
+                    })
+                    
+                except Exception as e:
+                    print(f"[HYBRID] Error processing point {point.id}: {e}")
+                    errors += 1
+            
+            # Upsert batch to hybrid collection
+            if hybrid_points:
+                self.upsert_hybrid_batch(hybrid_points)
+                migrated += len(hybrid_points)
+                print(f"[HYBRID] Migrated {migrated} points...")
+            
+            if next_offset is None:
+                break
+            offset = next_offset
+        
+        print(f"[HYBRID] Migration complete: {migrated} points migrated, {errors} errors")
+        return {
+            "migrated": migrated,
+            "errors": errors,
         }
 
 

@@ -177,6 +177,15 @@ def save_message_to_db(message: "discord.Message") -> bool:
                 "type": getattr(message.channel, 'type', 0).value if hasattr(getattr(message.channel, 'type', 0), 'value') else 0,
             })
             
+            # Extract content - for bot messages with embeds, use embed description
+            content = message.content or ""
+            if not content and message.embeds:
+                # Bot responses typically have the answer in embed description
+                for embed in message.embeds:
+                    if embed.description:
+                        content = embed.description
+                        break
+            
             # Insert message
             conn.execute(text("""
                 INSERT INTO messages (id, channel_id, guild_id, author_id, content, reply_to_id, 
@@ -191,7 +200,7 @@ def save_message_to_db(message: "discord.Message") -> bool:
                 "channel_id": message.channel.id,
                 "guild_id": message.guild.id,
                 "author_id": message.author.id,
-                "content": message.content or "",
+                "content": content,
                 "reply_to_id": message.reference.message_id if message.reference else None,
                 "attachment_count": len(message.attachments),
                 "embed_count": len(message.embeds),
@@ -231,36 +240,10 @@ def save_message_to_db(message: "discord.Message") -> bool:
                     _queue_attachment_processing(attachment, message.guild.id, message.channel.id)
             
             conn.commit()
-            
-            # Queue real-time indexing to Qdrant (non-blocking)
-            # Skip bot messages and empty content
-            if not message.author.bot and message.content and message.content.strip():
-                _queue_message_for_indexing(message)
-            
             return True
     except Exception as e:
         print(f"Error saving message to DB: {e}")
         return False
-
-
-def _queue_message_for_indexing(message: "discord.Message") -> None:
-    """
-    Queue a message for real-time indexing to Qdrant.
-    
-    This enables immediate searchability of new messages.
-    """
-    try:
-        from apps.bot.src.tasks import index_single_message
-        
-        index_single_message.delay(
-            guild_id=message.guild.id,
-            channel_id=message.channel.id,
-            channel_name=message.channel.name,
-            message_id=message.id,
-        )
-    except Exception as e:
-        # Don't fail message save if indexing queue fails
-        print(f"[WARNING] Failed to queue message for indexing: {e}")
 
 
 # Bot setup with required intents
@@ -476,6 +459,7 @@ async def handle_mention(message: discord.Message) -> None:
                     "http://localhost:8000/ask",
                     json={
                         "guild_id": message.guild.id,
+                        "channel_id": message.channel.id,
                         "query": question,
                     },
                     timeout=60.0,

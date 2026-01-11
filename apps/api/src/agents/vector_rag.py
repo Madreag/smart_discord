@@ -33,11 +33,19 @@ async def search_vectors(
     limit: int = 5,
     channel_ids: Optional[list[int]] = None,
     qdrant_client: Optional[Any] = None,
+    use_hybrid: bool = True,
+    use_reranking: bool = True,
 ) -> list[dict[str, Any]]:
     """
-    Search Qdrant for semantically similar content.
+    Search Qdrant for semantically similar content using hybrid search.
     
     SECURITY: Always filters by guild_id for multi-tenant isolation.
+    
+    Hybrid search combines:
+    1. Dense vectors (semantic similarity)
+    2. Sparse vectors (BM25 keyword matching)
+    3. RRF fusion to combine results
+    4. Late interaction reranking for highest quality
     
     Args:
         query: Natural language query to search for
@@ -46,13 +54,14 @@ async def search_vectors(
         limit: Maximum number of results
         channel_ids: Optional list of channel IDs to filter
         qdrant_client: Optional Qdrant client instance (ignored, uses service)
+        use_hybrid: Whether to use hybrid search (default True)
+        use_reranking: Whether to apply late interaction reranking (default True)
         
     Returns:
         List of search results with payloads and scores
     """
     try:
         from apps.api.src.services.qdrant_service import qdrant_service
-        from apps.api.src.core.llm_factory import get_embedding_model
         import re
         
         # Detect if query mentions attachments/files - search documents first
@@ -63,44 +72,138 @@ async def search_vectors(
         file_keywords = r'\b(file|document|pdf|report|attachment|attached|uploaded)\b'
         mentions_file = re.search(file_keywords, query, re.IGNORECASE)
         
-        # Get embedding for query (use clean query for better matching)
+        # Clean query for embedding
         clean_query = re.sub(attachment_pattern, '', query).strip()
-        embedding_model = get_embedding_model()
-        query_embedding = embedding_model.embed_query(clean_query if clean_query else query)
+        search_query = clean_query if clean_query else query
         
         results = []
         
-        # If attachments mentioned, search documents first with lower threshold
-        if attachment_match or mentions_file:
-            print(f"[VECTOR_RAG] Detected document query, searching document chunks first")
-            doc_results = qdrant_service.search(
-                query_embedding=query_embedding,
+        # Try hybrid search first if enabled
+        if use_hybrid:
+            results = await _hybrid_search(
+                query=search_query,
+                guild_id=guild_id,
+                channel_ids=channel_ids,
+                limit=limit * 2 if use_reranking else limit,  # Oversample for reranking
+                source_types=['pdf', 'markdown', 'text', 'image'] if (attachment_match or mentions_file) else None,
+            )
+            
+            if results:
+                print(f"[VECTOR_RAG] Hybrid search found {len(results)} results")
+        
+        # Fallback to legacy dense-only search if hybrid fails or returns nothing
+        if not results:
+            results = await _legacy_search(
+                query=search_query,
                 guild_id=guild_id,
                 channel_ids=channel_ids,
                 limit=limit,
-                score_threshold=0.0,  # Lower threshold for documents
-                source_types=['pdf', 'markdown', 'text', 'image'],
+                source_types=['pdf', 'markdown', 'text', 'image'] if (attachment_match or mentions_file) else None,
             )
-            results.extend(doc_results)
-            
-            # If we found documents, return them; otherwise fall back to chat
-            if results:
-                print(f"[VECTOR_RAG] Found {len(results)} document chunks")
-                return results
         
-        # Standard search (chat messages + documents)
-        results = qdrant_service.search(
-            query_embedding=query_embedding,
+        # Apply late interaction reranking if enabled and we have results
+        if use_reranking and results and len(results) > 1:
+            results = _apply_reranking(search_query, results, limit)
+        
+        return results[:limit]
+        
+    except Exception as e:
+        print(f"Vector search error: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+async def _hybrid_search(
+    query: str,
+    guild_id: int,
+    channel_ids: Optional[list[int]] = None,
+    limit: int = 10,
+    source_types: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    """
+    Perform hybrid search using dense + sparse vectors with RRF fusion.
+    """
+    try:
+        from apps.api.src.services.qdrant_service import qdrant_service
+        from apps.api.src.services.hybrid_embedding import get_hybrid_embedding_model
+        
+        # Get hybrid embeddings (dense + sparse)
+        hybrid_model = get_hybrid_embedding_model()
+        hybrid_embedding = hybrid_model.embed_query(query)
+        
+        # Perform hybrid search with RRF fusion
+        results = qdrant_service.hybrid_search(
+            query_dense=hybrid_embedding.dense,
+            query_sparse_indices=hybrid_embedding.sparse_indices,
+            query_sparse_values=hybrid_embedding.sparse_values,
             guild_id=guild_id,
             channel_ids=channel_ids,
             limit=limit,
+            source_types=source_types,
         )
         
         return results
         
     except Exception as e:
-        print(f"Vector search error: {e}")
+        print(f"[VECTOR_RAG] Hybrid search failed: {e}")
         return []
+
+
+async def _legacy_search(
+    query: str,
+    guild_id: int,
+    channel_ids: Optional[list[int]] = None,
+    limit: int = 5,
+    source_types: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    """
+    Fallback to legacy dense-only search.
+    """
+    try:
+        from apps.api.src.services.qdrant_service import qdrant_service
+        from apps.api.src.core.llm_factory import get_embedding_model
+        
+        embedding_model = get_embedding_model()
+        query_embedding = embedding_model.embed_query(query)
+        
+        results = qdrant_service.search(
+            query_embedding=query_embedding,
+            guild_id=guild_id,
+            channel_ids=channel_ids,
+            limit=limit,
+            source_types=source_types,
+        )
+        
+        return results
+        
+    except Exception as e:
+        print(f"[VECTOR_RAG] Legacy search failed: {e}")
+        return []
+
+
+def _apply_reranking(
+    query: str,
+    results: list[dict[str, Any]],
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    """
+    Apply late interaction reranking to improve result quality.
+    """
+    try:
+        from apps.api.src.services.hybrid_embedding import get_late_interaction_model
+        
+        reranker = get_late_interaction_model()
+        if reranker.enabled:
+            reranked = reranker.rerank(query, results, top_k=top_k)
+            print(f"[VECTOR_RAG] Reranked {len(results)} results to top {len(reranked)}")
+            return reranked
+        
+        return results[:top_k]
+        
+    except Exception as e:
+        print(f"[VECTOR_RAG] Reranking failed: {e}")
+        return results[:top_k]
 
 
 async def _get_embedding(text: str) -> list[float]:
@@ -124,21 +227,21 @@ async def generate_rag_response(
     query: str,
     context_chunks: list[dict[str, Any]],
     guild_id: int,
-    conversation_context: str = "",
+    recent_messages_context: str = "",
 ) -> str:
     """
     Generate a response using retrieved context.
     
     Args:
         query: Original user query
-        context_chunks: Retrieved context from vector search
+        context_chunks: Retrieved context from vector search (long-term/Qdrant)
         guild_id: Guild ID for context
-        conversation_context: Recent conversation history for session continuity
+        recent_messages_context: Last 30 channel messages from Postgres (short-term memory)
         
     Returns:
         Generated response string
     """
-    if not context_chunks and not conversation_context:
+    if not context_chunks and not recent_messages_context:
         return "I couldn't find any relevant discussions matching your query."
     
     try:
@@ -176,20 +279,27 @@ async def generate_rag_response(
         pre_prompt = get_guild_pre_prompt(guild_id)
         pre_prompt_section = f"\n\n{pre_prompt}" if pre_prompt else ""
         
-        # Add conversation context section
-        conversation_section = ""
-        if conversation_context:
-            conversation_section = f"\n\nRecent conversation in this channel:\n{conversation_context}"
+        # Add recent channel messages (short-term memory from Postgres - respects deletions)
+        recent_section = ""
+        if recent_messages_context:
+            recent_section = f"\n\nRecent channel messages (last 30):\n{recent_messages_context}"
         
         system_prompt = f"""You are a helpful assistant analyzing Discord community discussions.
-Based on the retrieved context from the community's message history, answer the user's question.
-Be concise and cite specific discussions when relevant.
-If the context doesn't contain enough information, say so.
-You can reference your previous answers in the current conversation if relevant.{pre_prompt_section}"""
+Answer the user's question using the provided context.
 
-        user_content = f"Context from message history:\n{context_text}" if context_text else ""
-        if conversation_section:
-            user_content += conversation_section
+Priority for answering:
+1. First check "Recent channel messages" - these are the most current discussions
+2. Then check "Historical context" from the archive for older information
+
+Be concise and cite specific messages when relevant.
+If the context doesn't contain enough information, say so.{pre_prompt_section}"""
+
+        # Build user content with recent messages taking priority
+        user_content = ""
+        if recent_section:
+            user_content += recent_section
+        if context_text:
+            user_content += f"\n\nHistorical context from archive:\n{context_text}"
         user_content += f"\n\nQuestion: {query}"
 
         response = await llm.ainvoke([
@@ -238,11 +348,16 @@ async def process_rag_query(
     
     This is the main entry point for the Vector RAG agent.
     
+    Strategy:
+    1. First check recent messages (last 30) from the current channel - no RAG needed
+    2. If no matches found, fall back to Qdrant vector search for long-term memory
+    
     Args:
         query: Natural language query
         guild_id: Guild ID for filtering (REQUIRED)
         channel_ids: Optional channel filter
         qdrant_client: Optional Qdrant client
+        channel_id: Optional current channel ID for recent message lookup
         
     Returns:
         AskResponse with answer and sources
@@ -250,16 +365,31 @@ async def process_rag_query(
     import time
     start_time = time.time()
     
-    # Get conversation context if channel_id provided
-    conversation_context = ""
+    # Get recent messages from Postgres (authoritative, respects deletions)
+    recent_messages_context = ""
+    
     if channel_id:
         try:
-            from apps.api.src.services.conversation_memory import conversation_memory
-            conversation_context = conversation_memory.get_context(channel_id, max_messages=5)
-        except Exception:
-            pass
+            from apps.api.src.services.conversation_memory import (
+                get_recent_channel_messages,
+                format_recent_messages_as_context,
+            )
+            
+            # Get last 30 messages from the channel (short-term memory)
+            # This is from Postgres which properly handles deletions (Right to be Forgotten)
+            recent_messages = get_recent_channel_messages(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                limit=30,
+            )
+            
+            if recent_messages:
+                recent_messages_context = format_recent_messages_as_context(recent_messages)
+                print(f"[VECTOR_RAG] Using {len(recent_messages)} recent messages as short-term context")
+        except Exception as e:
+            print(f"[VECTOR_RAG] Error fetching recent messages: {e}")
     
-    # Search for relevant content
+    # Search Qdrant for long-term memory (historical content)
     results = await search_vectors(
         query=query,
         guild_id=guild_id,
@@ -267,8 +397,13 @@ async def process_rag_query(
         qdrant_client=qdrant_client,
     )
     
-    # Generate response from context
-    answer = await generate_rag_response(query, results, guild_id, conversation_context)
+    # Generate response from context (recent messages + RAG results)
+    answer = await generate_rag_response(
+        query=query,
+        context_chunks=results,
+        guild_id=guild_id,
+        recent_messages_context=recent_messages_context,
+    )
     
     # Convert results to MessageSource format (supports both chat and document sources)
     sources = []
